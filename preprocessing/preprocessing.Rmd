@@ -1,18 +1,291 @@
 ---
-title: "R Notebook"
+title: "Project 1- Preprocessing"
+authors: "Eva Martín, Laura González"
 output: html_notebook
 ---
 
-This is an [R Markdown](http://rmarkdown.rstudio.com) Notebook. When you execute code within the notebook, the results appear beneath the code. 
-
-Try executing this chunk by clicking the *Run* button within the chunk or by placing your cursor inside it and pressing *Ctrl+Shift+Enter*. 
-
+#Libraries
 ```{r}
-plot(cars)
+library(dplyr)
+library(missMDA)
+library(FactoMineR)
+library(car)
+library(mice)
+library (chemometrics)
+library(MASS)
+library(AER)
+library(effects)
+library(lmtest)
+library(DescTools)
+library(ResourceSelection)
+library(statmod)
+library(cvAUC)
+library(caret)
+library(ModelMetrics)
+library(pROC)
+
+```
+#Load dataset and create dataframe
+```{r}
+df <- read.csv("C:/Users/lglez/Documents/MDS/Q3/AML/AML-Project1/data/bank-full.csv",
+               sep = ";")
+
+summary(df)
+
+df_no_dupl <- distinct(df) #there are no duplicates in our dataset 
+rm(df_no_dupl)
+
+
 ```
 
-Add a new chunk by clicking the *Insert Chunk* button on the toolbar or by pressing *Ctrl+Alt+I*.
+#Exploratory analisis
+Assign correct datatype to each variable
+No missing values, so no imputation method is required
+```{r}
+sapply(df, class)
 
-When you save the notebook, an HTML file containing the code and output will be saved alongside it (click the *Preview* button or press *Ctrl+Shift+K* to preview the HTML file).
+# Convert characaters to categorical variables 
+df[sapply(df, is.character)] <- lapply(df[sapply(df, is.character)], as.factor)
+summary (df)
 
-The preview shows you a rendered HTML copy of the contents of the editor. Consequently, unlike *Knit*, *Preview* does not run any R code chunks. Instead, the output of the chunk when it was last run in the editor is displayed.
+```
+#Variables. From the dataset source:
+1 - age (numeric)
+487 outliers, all on the upper side. 3 of them severe. Not normally distributed
+```{r}
+summary(df[,1])
+
+hist(df$age, breaks = 40, freq = F);curve(dnorm(x, mean(df$age), sd(df$age)), add = T)
+
+Boxplot(df$age)
+length(Boxplot(df$age, id=list(n=Inf)))
+
+varsumm1<-summary (df[,1])
+iqr1 <- varsumm1[5]-varsumm1[2]
+
+umout1 <- varsumm1[5]+1.5*iqr1; umout1
+usout1 <- varsumm1[5]+3*iqr1; usout1
+
+lmout1 <- varsumm1[2]-1.5*iqr1; lmout1
+lsout1 <- varsumm1[2]-3*iqr1; lsout1
+
+mout1<- which((df[,1]<lmout1)|(df[,1]>umout1));length(mout1) #487 mout
+sout1 <-which((df[,1]<lsout1)|(df[,1]>usout1));length(sout1) #3 sout
+
+```
+
+2 - job : type of job (categorical:"admin.","unknown","unemployed","management","housemaid","entrepreneur","student","blue-collar","self-employed","retired","technician","services")
+12 levels
+```{r}
+summary(df[,2])
+str(df$job)
+plot(df$job) 
+
+```
+
+
+3 - marital : marital status (categorical: "married","divorced","single"; note: "divorced" means divorced or widowed)
+```{r}
+summary(df[,3])
+str(df$marital)
+plot(df$marital) 
+```
+
+4 - education (categorical: "unknown","secondary","primary","tertiary")
+```{r}
+summary(df[,4])
+str(df$education)
+plot(df$education)
+```
+
+5 - default: has credit in default? (binary: "yes","no")
+```{r}
+summary(df[,5])
+str(df$default)
+plot(df$default)
+```
+6 - balance: average yearly balance, in euros (numeric)
+about 15% of outliers. canidate for future categorical variable
+```{r}
+summary(df[,6])
+
+hist(df$balance, breaks = 40, freq = F);curve(dnorm(x, mean(df$balance), sd(df$balance)), add = T)
+
+Boxplot(df$balance)
+length(Boxplot(df$balance, id=list(n=Inf)))
+
+varsumm6<-summary (df[,6])
+iqr6 <- varsumm6[5]-varsumm6[2]
+
+umout6 <- varsumm6[5]+1.5*iqr6; umout6
+usout6 <- varsumm6[5]+3*iqr6; usout6
+
+lmout6 <- varsumm6[2]-1.5*iqr6; lmout6
+lsout6 <- varsumm6[2]-3*iqr6; lsout6
+
+mout6<- which((df[,6]<lmout6)|(df[,6]>umout6));length(mout6) #4729 mout
+sout6 <-which((df[,6]<lsout6)|(df[,6]>usout6));length(sout6) #2443 sout
+```
+
+7 - housing: has housing loan? (binary: "yes","no")
+```{r}
+summary(df[,7])
+str(df$housing)
+plot(df$housing)
+```
+
+
+8 - loan: has personal loan? (binary: "yes","no")
+```{r}
+summary(df[,8])
+str(df$loan)
+plot(df$loan)
+```
+
+# related with the last contact of the current campaign:
+9 - contact: contact communication type (categorical: "unknown","telephone","cellular")
+```{r}
+summary(df[,9])
+str(df$contact)
+plot(df$contact)
+```
+
+10 - day: last contact day of the month (numeric)
+doesn't make sense to treat it as a numeric value
+```{r}
+df$day <- as.factor(df$day)
+summary(df[,10])
+str(df$day)
+plot(df$day)
+
+```
+
+11 - month: last contact month of year (categorical: "jan", "feb", "mar", …, "nov", "dec")
+circular variable (after dec -> jan again)
+```{r}
+# Order
+df$month <- factor(df$month, 
+                   levels = c("jan","feb","mar","apr","may","jun",
+                              "jul","aug","sep","oct","nov","dec"),
+                   ordered = TRUE)
+
+#Cyclic codification
+df$month_sin <- sin(2*pi*as.numeric(df$month)/12)
+df$month_cos <- cos(2*pi*as.numeric(df$month)/12)
+
+summary(df[,11])    
+str(df$month)
+
+
+plot(df$month)
+
+```
+
+12 - duration: last contact duration, in seconds (numeric)
+not normally dist
+```{r}
+summary(df[,12])
+
+hist(df$duration, breaks = 40, freq = F);curve(dnorm(x, mean(df$duration), sd(df$duration)), add = T)
+
+Boxplot(df$duration)
+length(Boxplot(df$duration, id=list(n=Inf)))
+
+varsumm12<-summary (df[,12])
+iqr12 <- varsumm12[5]-varsumm12[2]
+
+umout12 <- varsumm12[5]+1.5*iqr12; umout12
+usout12<- varsumm12[5]+3*iqr12; usout12
+
+lmout12<- varsumm12[2]-1.5*iqr12; lmout12
+lsout12<- varsumm12[2]-3*iqr12; lsout12
+
+mout12<- which((df[,12]<lmout12)|(df[,12]>umout12));length(mout12) #3235 mout
+sout12<-which((df[,12]<lsout12)|(df[,12]>usout12));length(sout12) #1155 sout
+
+```
+
+# other attributes:
+13 - campaign: number of contacts performed during this campaign and for this client (numeric, includes last contact)
+```{r}
+summary(df[,13])
+
+hist(df$campaign, breaks = 40, freq = F);curve(dnorm(x, mean(df$campaign), sd(df$campaign)), add = T)
+
+Boxplot(df$campaign)
+length(Boxplot(df$campaign, id=list(n=Inf)))
+
+varsumm13<-summary (df[,13])
+iqr13 <- varsumm13[5]-varsumm13[2]
+
+umout13 <- varsumm13[5]+1.5*iqr13; umout13
+usout13<- varsumm13[5]+3*iqr13; usout13
+
+lmout13<- varsumm13[2]-1.5*iqr13; lmout13
+lsout13<- varsumm13[2]-3*iqr13; lsout13
+
+mout13<- which((df[,13]<lmout13)|(df[,13]>umout13));length(mout13) #3064 mout
+sout13<-which((df[,13]<lsout13)|(df[,13]>usout13));length(sout13) #1462 sout
+
+```
+
+14 - pdays: number of days that passed by after the client was last contacted from a previous campaign (numeric, -1 means client was not previously contacted)
+problematic variable. addressed in 2 different variables:
+- binary value if was contacted or not 
+- replace -1 with nas: 82 % of NAs -> remove feature
+```{r}
+df$was_contacted <- ifelse(df$pdays == -1, 0, 1)
+df$was_contacted <- as.factor(df$was_contacted)
+summary(df$was_contacted)
+str(df$was_contacted)
+plot(df$was_contacted)
+
+df$pdays <- ifelse(df$pdays == -1, NA, df$pdays)
+summary (df$pdays)
+df <- subset(df, select = -pdays)
+summary(df)
+
+```
+
+
+15 - previous: number of contacts performed before this campaign and for this client (numeric)
+```{r}
+summary(df[,14])
+
+hist(df$previous, breaks = 40, freq = F);curve(dnorm(x, mean(df$previous), sd(df$previous)), add = T)
+
+Boxplot(df$previous)
+length(Boxplot(df$previous, id=list(n=Inf)))
+
+varsumm14<-summary (df[,14])
+iqr14 <- varsumm14[5]-varsumm14[2]
+
+umout14 <- varsumm14[5]+1.5*iqr14; umout14
+usout14<- varsumm14[5]+3*iqr14; usout14
+
+lmout14<- varsumm14[2]-1.5*iqr14; lmout14
+lsout14<- varsumm14[2]-3*iqr14; lsout14
+
+mout14<- which((df[,14]<lmout14)|(df[,14]>umout14));length(mout14) #8257 mout
+sout14<-which((df[,14]<lsout14)|(df[,14]>usout14));length(sout14) #8257 sout
+```
+
+
+16 - poutcome: outcome of the previous marketing campaign (categorical: "unknown","other","failure","success")
+```{r}
+summary(df[,15])
+str(df$poutcome)
+plot(df$poutcome)
+```
+
+
+Output variable (desired target):
+17 - y - has the client subscribed a term deposit? (binary: "yes","no")
+
+```{r}
+summary(df[,16])
+str(df$y)
+plot(df$y)
+
+```
+
