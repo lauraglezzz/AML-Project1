@@ -27,7 +27,7 @@ library(pROC)
 ```
 #Load dataset and create dataframe
 ```{r}
-df <- read.csv("C:/Users/lglez/Documents/MDS/Q3/AML/AML-Project1/data/bank-full.csv",
+df <- read.csv("../data/bank-full.csv",
                sep = ";")
 
 summary(df)
@@ -287,5 +287,12 @@ summary(df[,16])
 str(df$y)
 plot(df$y)
 
+```
+Save clean dataset into an R object:
+
+```{r}
+df_clean <- df %>% dplyr::select(-month)
+dir.create("../artifacts", showWarnings = FALSE)
+save(df_clean, file = "../artifacts/df_clean.RData")
 ```
 
