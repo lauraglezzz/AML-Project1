@@ -335,6 +335,10 @@ corrplot(
 
 
 ```
+
+
+Cuando hayamos acabado todo el preprocessing:
+
 Save clean dataset into an R object:
 
 ```{r}
