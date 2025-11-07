@@ -1,0 +1,163 @@
+---
+title: "Project 1- Experimental Protocol"
+authors: "Eva Martín, Laura González"
+output: html_notebook
+---
+
+```{r}
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(rsample)    
+  library(yardstick)  
+  library(recipes)
+  library(themis)
+})
+
+set.seed(202)
+```
+
+First we load the preprocessed data and do the initial train/test split:
+
+```{r}
+# load preprocessed data
+load("../artifacts/df_clean.RData")
+
+# stratified train/test split (80/20) 
+split <- initial_split(df_clean, prop = 0.8, strata = y)
+train <- training(split)
+test  <- testing(split)
+
+# prevalence check
+prev_train <- mean(train$y == "yes")
+prev_test  <- mean(test$y == "yes")
+sprintf("Train prevalence (yes): %.3f | Test prevalence (yes): %.3f",
+                prev_train, prev_test)
+```
+
+Then we set some cross-validation folds and define the main evaluation metrics that will be used later to compare model performance.
+
+```{r}
+# K-fold CV on train (stratified)
+folds <- vfold_cv(train, v = 5, strata = y)
+
+# metrics to report later
+metric_set_main <- metric_set(roc_auc, pr_auc, f_meas, bal_accuracy, accuracy)
+```
+
+Now will define a base preprocessing recipe and compute class weights for the models that we will build in subsequent steps.
+
+```{r}
+# base recipe: one-hot encode categoricals, normalize numerics
+rec_base <- recipe(y ~ ., data = train) %>%
+  step_dummy(all_nominal_predictors(), one_hot = TRUE) %>%  # one-hot for factors
+  step_normalize(all_numeric_predictors())# standardize numerics
+
+# class weights: useful to set 'weights' argument for the following models
+class_counts <- table(train$y)
+w_pos <- sum(class_counts) / (2 * class_counts["yes"]) # weight for minority (yes)
+w_neg <- sum(class_counts) / (2 * class_counts["no"]) # weight for majority 
+class_weights <- ifelse(train$y == "yes", w_pos, w_neg)
+```
+
+
+Next, we’ll prep the recipes and create clean design matrices for training/testing so models can be fit directly.
+
+prep(): fits the recipe on the training data — it learns all preprocessing parameters (e.g., means and sds for normalization, levels for one-hot encoding).
+→ Think of it as “training the preprocessing”.
+bake(): applies the already prepared recipe to any dataset (train, validation, or test) using those learned parameters.
+→ Think of it as “transforming the data with the learned preprocessing”.
+```{r}
+# helper: compute the main metrics from truth and predicted probs
+eval_metrics <- function(y_true, p_hat) {
+  df <- tibble(
+    y = factor(y_true, levels = c("no","yes")),
+    .pred_yes = as.numeric(p_hat),
+    .pred_class = factor(ifelse(p_hat >= 0.5, "yes", "no"),
+                         levels = c("no","yes"))
+  )
+
+  # yardstick expects specific column names
+  tibble(
+    roc_auc       = roc_auc(df, truth = y, .pred_yes)$.estimate,
+    pr_auc        = pr_auc(df, truth = y, .pred_yes)$.estimate,
+    f1            = f_meas(df, truth = y, estimate = .pred_class)$.estimate,
+    bal_accuracy  = bal_accuracy(df, truth = y, estimate = .pred_class)$.estimate,
+    accuracy      = accuracy(df, truth = y, estimate = .pred_class)$.estimate
+  )
+}
+
+# fit logistic regression and return validation probabilities
+fit_predict_logit <- function(X_tr, y_tr, X_va, weights = NULL) {
+  # turn y into 0/1
+  y_tr_num <- as.integer(y_tr == "yes")
+  df_tr <- cbind.data.frame(y = y_tr_num, X_tr)
+
+  # use per-fold weights if provided
+  if (is.null(weights)) {
+    fit <- glm(y ~ ., data = df_tr, family = binomial())
+  } else {
+    stopifnot(length(weights) == nrow(df_tr))
+    fit <- glm(y ~ ., data = df_tr, family = binomial(), weights = weights)
+  }
+
+  # predict probabilities on validation set
+  p_va <- as.numeric(predict(fit, newdata = as.data.frame(X_va), type = "response"))
+  p_va
+}
+
+# fold-wise prep: base recipe only + per-fold class weights
+prep_fold_data <- function(split) {
+  ana <- rsample::analysis(split)
+  ass <- rsample::assessment(split)
+
+  # prep the base recipe on analysis data
+  rec_prep <- recipes::prep(rec_base, training = ana, retain = TRUE)
+
+  # bake analysis and assessment to design matrices
+  ana_bake <- recipes::bake(rec_prep, new_data = ana)
+  ass_bake <- recipes::bake(rec_prep, new_data = ass)
+
+  # split into X / y
+  y_tr <- factor(ana_bake$y, levels = c("no","yes"))
+  X_tr <- dplyr::select(ana_bake, -y)
+
+  y_va <- factor(ass_bake$y, levels = c("no","yes"))
+  X_va <- dplyr::select(ass_bake, -y)
+
+  # per-fold class weights (inverse frequency)
+  tab <- table(y_tr)
+  w_yes <- as.numeric(sum(tab) / (2 * tab["yes"]))
+  w_no  <- as.numeric(sum(tab) / (2 * tab["no"]))
+  w_tr  <- ifelse(y_tr == "yes", w_yes, w_no)
+
+  list(X_tr = X_tr, y_tr = y_tr, X_va = X_va, y_va = y_va, w_tr = w_tr)
+}
+
+# CV for logistic regression using the base recipe 
+cv_logit <- function(folds, use_weights = TRUE) {
+  fold_metrics <- purrr::map(folds$splits, function(spl) {
+    fd <- prep_fold_data(spl)
+    w  <- if (use_weights) fd$w_tr else NULL
+    p  <- fit_predict_logit(fd$X_tr, fd$y_tr, fd$X_va, weights = w)
+    eval_metrics(fd$y_va, p)
+  }) %>% dplyr::bind_rows()
+
+  summary <- dplyr::summarise(
+    fold_metrics,
+    dplyr::across(
+      dplyr::everything(),
+      list(mean = mean, sd = sd)
+    )
+  )
+
+  list(per_fold = fold_metrics, summary = summary)
+}
+
+# example run
+v_logit_base <- cv_logit(folds, use_weights = TRUE)
+print(v_logit_base$summary)
+
+v_logit_unw  <- cv_logit(folds, use_weights = FALSE)
+print(v_logit_unw$summary)
+```
+

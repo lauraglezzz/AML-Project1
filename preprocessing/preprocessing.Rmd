@@ -29,7 +29,7 @@ library(pROC)
 ```
 #Load dataset and create dataframe
 ```{r}
-df <- read.csv("C:/Users/lglez/Documents/MDS/Q3/AML/AML-Project1/data/bank-full.csv",
+df <- read.csv("../data/bank-full.csv",
                sep = ";")
 
 summary(df)
@@ -549,6 +549,17 @@ fviz_pca_var(pca,
   labs(title = "PCA - Variable contributions")
 
 
+```
+
+
+Cuando hayamos acabado todo el preprocessing:
+
+Save clean dataset into an R object:
+
+```{r}
+df_clean <- df %>% dplyr::select(-month)
+dir.create("../artifacts", showWarnings = FALSE)
+save(df_clean, file = "../artifacts/df_clean.RData")
 ```
 
 
