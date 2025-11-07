@@ -144,7 +144,6 @@ str(df$loan)
 plot(df$loan)
 ```
 
-# related with the last contact of the current campaign:
 9 - contact: contact communication type (categorical: "unknown","telephone","cellular")
 ```{r}
 summary(df[,9])
@@ -227,7 +226,6 @@ sout12<-which((df[,12]<lsout12)|(df[,12]>usout12));length(sout12) #1155 sout
 
 ```
 
-# other attributes:
 13 - campaign: number of contacts performed during this campaign and for this client (numeric, includes last contact)
 ```{r}
 summary(df[,13])
@@ -332,6 +330,223 @@ corrplot(
   addgrid.col = "grey90",   
   cl.pos = "r"             
 )
+
+
+```
+
+# Data preparation
+
+```{r}
+# ============================================================
+# DATA PREPROCESSING PIPELINE 
+# ============================================================
+
+# ---  Start from EDA dataframe ---
+df_clean <- df
+
+# Remove original 'month' variable (cyclical encoding already present)
+if ("month" %in% names(df_clean)) {
+  df_clean <- subset(df_clean, select = -month)
+  cat("Removed original 'month' variable (cyclical encoding already present).\n")
+}
+
+# ============================================================
+# ---  Split dataset into training and testing subsets ---
+# ============================================================
+
+set.seed(123)
+N <- nrow(df_clean)
+learn <- sample(1:N, round(2 * N / 3))
+nlearn <- length(learn)
+ntest  <- N - nlearn
+
+train <- df_clean[learn, ]
+test  <- df_clean[-learn, ]
+
+cat("Training set size:", nlearn, "\n")
+cat("Testing set size:", ntest, "\n")
+
+# ============================================================
+# ---  Outlier treatment via Winsorization ---
+# ============================================================
+
+num_outliers <- c("balance", "duration", "previous", "campaign")
+
+winsorize <- function(x, p = 0.99) {
+  upper <- quantile(x, p, na.rm = TRUE)
+  x[x > upper] <- upper
+  return(x)
+}
+
+train$balance  <- winsorize(train$balance,  p = 0.99)
+train$duration <- winsorize(train$duration, p = 0.99)
+train$previous <- winsorize(train$previous, p = 0.99)
+train$campaign <- winsorize(train$campaign, p = 0.995)
+
+test$balance  <- winsorize(test$balance,  p = 0.99)
+test$duration <- winsorize(test$duration, p = 0.99)
+test$previous <- winsorize(test$previous, p = 0.99)
+test$campaign <- winsorize(test$campaign, p = 0.995)
+
+cat("Winsorization thresholds:\n")
+cat(" - balance  capped at:", quantile(train$balance, 0.99,  na.rm = TRUE), "\n")
+cat(" - duration capped at:", quantile(train$duration, 0.99, na.rm = TRUE), "\n")
+cat(" - previous capped at:", quantile(train$previous, 0.99, na.rm = TRUE), "\n")
+cat(" - campaign capped at:", quantile(train$campaign, 0.995, na.rm = TRUE), "\n")
+
+# ============================================================
+# ---  Log-transform highly skewed continuous variables ---
+# ============================================================
+
+# Following Kashyap (2023): log(1 + x) reduces skewness while preserving interpretability
+min_balance <- min(train$balance, na.rm = TRUE)
+if (min_balance <= 0) {
+  train$balance <- train$balance - min_balance + 1
+  test$balance  <- test$balance  - min_balance + 1
+}
+
+train$balance  <- log1p(train$balance)
+test$balance   <- log1p(test$balance)
+train$duration <- log1p(train$duration)
+test$duration  <- log1p(test$duration)
+
+# ============================================================
+# ---  Standardization (Z-score scaling) ---
+# ============================================================
+
+num_vars <- sapply(train, is.numeric)
+
+train_means <- sapply(train[, num_vars], mean, na.rm = TRUE)
+train_sds   <- sapply(train[, num_vars], sd,   na.rm = TRUE)
+
+train[, num_vars] <- scale(train[, num_vars],
+                           center = train_means,
+                           scale  = train_sds)
+
+test[,  num_vars] <- scale(test[,  num_vars],
+                           center = train_means,
+                           scale  = train_sds)
+
+# ============================================================
+# ---  Encoding categorical variables ---
+# ============================================================
+
+if (!"y" %in% names(train)) stop("Column 'y' not found in training data.")
+train$y <- factor(train$y, levels = c("no", "yes"))
+test$y  <- factor(test$y,  levels = c("no", "yes"))
+
+# Remove columns that are all-NA or constant
+train <- train[, colSums(is.na(train)) < nrow(train)]
+test  <- test[,  colSums(is.na(test))  < nrow(test)]
+
+# Convert character columns to factors (unordered)
+train[sapply(train, is.character)] <- lapply(train[sapply(train, is.character)], as.factor)
+test[sapply(test,  is.character)]  <- lapply(test[sapply(test,  is.character)],  as.factor)
+
+# Create a contrast list only for factor variables
+contr_list_train <- lapply(train[, sapply(train, is.factor), drop = FALSE],
+                           function(x) contrasts(x, contrasts = FALSE))
+contr_list_test  <- lapply(test[, sapply(test, is.factor), drop = FALSE],
+                           function(x) contrasts(x, contrasts = FALSE))
+
+# One-hot encoding (remove intercept)
+X_train <- model.matrix(y ~ ., data = train, contrasts.arg = contr_list_train)[, -1, drop = FALSE]
+y_train <- train$y
+X_test  <- model.matrix(y ~ ., data = test,  contrasts.arg = contr_list_test)[, -1, drop = FALSE]
+y_test  <- test$y
+
+cat("Dimensions of X_train:", dim(X_train), "\n")
+cat("Dimensions of X_test :", dim(X_test), "\n")
+table(y_train)
+
+
+# ============================================================
+# ---  Balance target variable (SMOTE) ---
+# ============================================================
+
+library(smotefamily)
+
+X_train_df  <- as.data.frame(X_train)
+y_train_vec <- as.factor(y_train)
+
+set.seed(123)
+smote_res <- SMOTE(X_train_df, y_train_vec, K = 5, dup_size = 5)
+train_bal <- smote_res$data
+train_bal$class <- factor(train_bal$class, levels = c("no", "yes"))
+
+cat("Balanced class proportions:\n")
+print(prop.table(table(train_bal$class)))
+
+# ============================================================
+# ---  Multicollinearity and redundancy diagnostics ---
+# ============================================================
+
+library(caret)
+X <- model.matrix(class ~ ., data = train_bal)[, -1]
+
+kappa_val <- base::kappa(X)
+cat("\nInitial condition number (kappa):", kappa_val, "\n")
+
+if (kappa_val < 30) {
+  cat("No significant multicollinearity detected.\n")
+} else if (kappa_val < 100) {
+  cat("Moderate multicollinearity.\n")
+} else {
+  cat("Strong multicollinearity detected — cleaning required.\n")
+}
+
+nzv <- nearZeroVar(X, saveMetrics = TRUE)
+if (any(nzv$nzv)) {
+  cat("\nRemoving near-zero variance variables:\n")
+  print(rownames(nzv[nzv$nzv == TRUE, ]))
+  X <- X[, !nzv$nzv]
+}
+
+combos <- findLinearCombos(X)
+if (!is.null(combos$remove)) {
+  cat("\nRemoving linear combinations:\n")
+  print(colnames(X)[combos$remove])
+  X <- X[, -combos$remove]
+}
+
+# Correlation check
+cor_mat <- cor(X, use = "pairwise.complete.obs")
+high_cor <- findCorrelation(cor_mat, cutoff = 0.95, names = TRUE)
+cat("\nHighly correlated variables (|r| > 0.95):\n")
+print(high_cor)
+
+# Remove redundant dummy if necessary
+X <- X[, setdiff(colnames(X), "poutcomeunknown")]
+
+# Final condition number
+kappa_val <- base::kappa(X)
+cat("\nFinal condition number (kappa):", kappa_val, "\n")
+
+# ============================================================
+# ---  Exploratory PCA  ---
+# ============================================================
+
+library(FactoMineR)
+library(factoextra)
+
+X_pca <- as.data.frame(X)
+pca <- prcomp(X_pca, center = TRUE, scale. = TRUE)
+
+# Explained variance
+summary(pca)
+
+# Scree plot
+fviz_eig(pca, addlabels = TRUE, barfill = "steelblue", barcolor = "steelblue") +
+  theme_minimal() +
+  labs(title = "Explained variance by principal components")
+
+# Variable contributions
+fviz_pca_var(pca,
+             col.var = "contrib",
+             gradient.cols = c("lightblue", "steelblue", "darkblue"),
+             repel = TRUE) +
+  theme_minimal() +
+  labs(title = "PCA - Variable contributions")
 
 
 ```
