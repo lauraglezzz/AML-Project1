@@ -23,7 +23,10 @@ First we load the preprocessed train data:
 load("../artifacts/train.RData")
 load("../artifacts/train_bal.RData")
 train <- train_bal
-train <- train %>% rename(y = class)
+if ("class" %in% names(train)) names(train)[names(train) == "class"] <- "y"
+
+cat("Loaded balanced training set:", nrow(train), "rows,", ncol(train), "columns\n")
+print(prop.table(table(train$y)))
 ```
 
 Then we set 5 cross-validation folds.
@@ -186,4 +189,185 @@ tbl <- tibble::tibble(
 )
 tbl
 ```
+LASSO Regularized Logistic Regression with the same cross validation
+```{r}
+
+
+library(glmnet)
+library(yardstick)
+library(tibble)
+
+cv_lasso_custom <- function(folds) {
+  fold_metrics <- purrr::map(folds$splits, function(spl) {
+    ana <- rsample::analysis(spl)
+    ass <- rsample::assessment(spl)
+    
+    # matrices
+    x_tr <- model.matrix(y ~ ., data = ana)[, -1]
+    y_tr <- as.numeric(ana$y == "yes")
+    x_va <- model.matrix(y ~ ., data = ass)[, -1]
+    y_va <- factor(ass$y, levels = c("yes","no"))
+    
+    # entrenamiento con CV interno (10-fold) para lambda
+    cvfit <- cv.glmnet(x_tr, y_tr, family = "binomial", alpha = 1, nfolds = 10)
+    p_va <- as.numeric(predict(cvfit, newx = x_va, s = "lambda.min", type = "response"))
+    
+    df <- tibble(
+      y = y_va,
+      .pred_yes = p_va,
+      .pred_class = factor(ifelse(p_va >= 0.5, "yes", "no"), levels = c("yes","no"))
+    )
+    
+    tibble(
+      roc_auc = roc_auc(df, truth = y, .pred_yes)$.estimate,
+      f1 = f_meas(df, truth = y, estimate = .pred_class)$.estimate,
+      accuracy = accuracy(df, truth = y, estimate = .pred_class)$.estimate
+    )
+  }) %>% bind_rows()
+  
+  summary <- summarise(fold_metrics, across(everything(), list(mean = mean, sd = sd)))
+  list(per_fold = fold_metrics, summary = summary)
+}
+
+v_lasso <- cv_lasso_custom(folds)
+print(v_lasso$summary)
+
+
+```
+
+```{r}
+s1 <- v_logit_base$summary
+s2 <- v_logit_unw$summary
+s3 <- v_lasso$summary
+
+digits <- 3
+fmt_pm  <- function(m,s) sprintf(paste0("%.",digits,"f ± %.",digits,"f"), m, s)
+
+tbl_glm_all <- tibble::tibble(
+  Method = c("GLM (weighted)", "GLM (unweighted)", "GLM (LASSO)"),
+  Accuracy = c(fmt_pm(s1$accuracy_mean, s1$accuracy_sd),
+               fmt_pm(s2$accuracy_mean, s2$accuracy_sd),
+               fmt_pm(s3$accuracy_mean, s3$accuracy_sd)),
+  `F1-score` = c(fmt_pm(s1$f1_mean, s1$f1_sd),
+                 fmt_pm(s2$f1_mean, s2$f1_sd),
+                 fmt_pm(s3$f1_mean, s3$f1_sd)),
+  `ROC AUC` = c(fmt_pm(s1$roc_auc_mean, s1$roc_auc_sd),
+                fmt_pm(s2$roc_auc_mean, s2$roc_auc_sd),
+                fmt_pm(s3$roc_auc_mean, s3$roc_auc_sd))
+)
+tbl_glm_all
+
+```
+
+Linear Discriminant Analysis (LDA)
+
+```{r}
+
+library(MASS)
+
+cv_lda <- function(folds) {
+fold_metrics <- purrr::map(folds$splits, function(spl) {
+ana <- rsample::analysis(spl)
+ass <- rsample::assessment(spl)
+
+# Preprocessing same as GLM
+rec_prep <- recipes::prep(rec_normalize, training = ana, retain = TRUE)
+ana_bake <- recipes::bake(rec_prep, new_data = ana)
+ass_bake <- recipes::bake(rec_prep, new_data = ass)
+
+y_tr <- factor(ana_bake$y, levels = c("yes","no"))
+X_tr <- dplyr::select(ana_bake, -y)
+y_va <- factor(ass_bake$y, levels = c("yes","no"))
+X_va <- dplyr::select(ass_bake, -y)
+
+# Training
+lda_fit <- lda(y_tr ~ ., data = cbind(y_tr, X_tr))
+pred <- predict(lda_fit, newdata = X_va)
+
+# Predictions
+p_va <- as.numeric(pred$posterior[, "yes"])
+class_pred <- factor(pred$class, levels = c("yes","no"))
+
+#  yardstick evaluation
+df <- tibble(
+  y = y_va,
+  .pred_yes = p_va,
+  .pred_class = class_pred
+)
+
+tibble(
+  roc_auc = roc_auc(df, truth = y, .pred_yes)$.estimate,
+  pr_auc = pr_auc(df, truth = y, .pred_yes)$.estimate,
+  f1 = f_meas(df, truth = y, estimate = .pred_class)$.estimate,
+  bal_accuracy = bal_accuracy(df, truth = y, estimate = .pred_class)$.estimate,
+  accuracy = accuracy(df, truth = y, estimate = .pred_class)$.estimate
+)
+
+}) %>% bind_rows()
+
+summary <- summarise(fold_metrics, across(everything(), list(mean = mean, sd = sd)))
+list(per_fold = fold_metrics, summary = summary)
+}
+
+#CV for LDA
+
+v_lda <- cv_lda(folds)
+print(v_lda$summary)
+
+```
+
+QDA
+```{r}
+library(MASS)
+
+cv_qda <- function(folds) {
+  fold_metrics <- purrr::map(folds$splits, function(spl) {
+    ana <- rsample::analysis(spl)
+    ass <- rsample::assessment(spl)
+
+    # Preprocessing same as LDA y GLM
+    rec_prep <- recipes::prep(rec_normalize, training = ana, retain = TRUE)
+    ana_bake <- recipes::bake(rec_prep, new_data = ana)
+    ass_bake <- recipes::bake(rec_prep, new_data = ass)
+
+    y_tr <- factor(ana_bake$y, levels = c("yes","no"))
+    X_tr <- dplyr::select(ana_bake, -y)
+    y_va <- factor(ass_bake$y, levels = c("yes","no"))
+    X_va <- dplyr::select(ass_bake, -y)
+
+    # Training QDA
+    qda_fit <- qda(y_tr ~ ., data = cbind(y_tr, X_tr))
+    pred <- predict(qda_fit, newdata = X_va)
+
+    # Predictions
+    p_va <- as.numeric(pred$posterior[, "yes"])
+    class_pred <- factor(pred$class, levels = c("yes","no"))
+
+    # Evaluation with yardstick
+    df <- tibble(
+      y = y_va,
+      .pred_yes = p_va,
+      .pred_class = class_pred
+    )
+
+    tibble(
+      roc_auc = roc_auc(df, truth = y, .pred_yes)$.estimate,
+      pr_auc = pr_auc(df, truth = y, .pred_yes)$.estimate,
+      f1 = f_meas(df, truth = y, estimate = .pred_class)$.estimate,
+      bal_accuracy = bal_accuracy(df, truth = y, estimate = .pred_class)$.estimate,
+      accuracy = accuracy(df, truth = y, estimate = .pred_class)$.estimate
+    )
+  }) %>% bind_rows()
+
+  summary <- summarise(fold_metrics, across(everything(), list(mean = mean, sd = sd)))
+  list(per_fold = fold_metrics, summary = summary)
+}
+
+# CV for QDA
+v_qda <- cv_qda(folds)
+print(v_qda$summary)
+
+```
+The Quadratic Discriminant Analysis (QDA) model could not be fitted on our dataset due to rank deficiency in the covariance matrices, which occurs when the number of predictors is large and many of them are linearly dependent (e.g., dummy variables from one-hot encoding). To address this limitation, we adopt Regularized Discriminant Analysis (RDA), a generalization of QDA that introduces terms to stabilize the covariance estimates and interpolate between LDA and QDA.
+
 
