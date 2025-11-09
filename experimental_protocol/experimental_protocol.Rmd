@@ -11,7 +11,14 @@ suppressPackageStartupMessages({
   library(yardstick)  
   library(recipes)
   library(themis)
+  library(furrr)
+  library(purrr)
 })
+
+# parallel plan
+# - Windows/macOS: multisession
+# - Linux: multicore 
+plan(multisession) 
 
 set.seed(202)
 ```
@@ -43,7 +50,8 @@ Now will define a base preprocessing recipe.
 rec_base <- recipe(y ~ ., data = train) 
 
 rec_normalize <- recipe(y ~ ., data = train) %>%
-  step_normalize(all_numeric_predictors())
+  step_normalize(all_numeric_predictors())  %>%
+  step_dummy(all_nominal_predictors(), one_hot = TRUE) 
 ```
 
 
@@ -364,10 +372,119 @@ cv_qda <- function(folds) {
 }
 
 # CV for QDA
-v_qda <- cv_qda(folds)
-print(v_qda$summary)
-
+#v_qda <- cv_qda(folds)
+#print(v_qda$summary)
 ```
 The Quadratic Discriminant Analysis (QDA) model could not be fitted on our dataset due to rank deficiency in the covariance matrices, which occurs when the number of predictors is large and many of them are linearly dependent (e.g., dummy variables from one-hot encoding). To address this limitation, we adopt Regularized Discriminant Analysis (RDA), a generalization of QDA that introduces terms to stabilize the covariance estimates and interpolate between LDA and QDA.
 
 
+```{r}
+# ===========================
+# RDA
+# ===========================
+cv_rda <- function(folds,
+                   gammas  = c(0, .1, .3, .5, .7, 1),
+                   lambdas = c(0, .1, .3, .5, .7, 1),
+                   lambda_floor = 1e-3) {
+
+  grid <- expand.grid(gamma = gammas, lambda = lambdas)
+
+  eval_one_combo <- function(gamma, lambda) {
+    gamma  <- min(max(gamma, 0), 1)
+    lambda <- max(min(max(lambda, 0), 1), lambda_floor)
+
+    per_fold <- map_dfr(seq_along(folds$splits), function(i) {
+      spl <- folds$splits[[i]]
+      ana <- rsample::analysis(spl)
+      ass <- rsample::assessment(spl)
+
+      rec_prep <- recipes::prep(rec_normalize, training = ana, retain = TRUE)
+      ana_bake <- recipes::bake(rec_prep, new_data = ana)
+      ass_bake <- recipes::bake(rec_prep, new_data = ass)
+
+      y_tr <- factor(ana_bake$y, levels = c("yes","no"))
+      y_va <- factor(ass_bake$y, levels = c("yes","no"))
+
+      X_tr <- dplyr::select(ana_bake, -y)
+      X_va <- dplyr::select(ass_bake, -y)
+
+      # Alinear columnas por si el recipe dropea algo
+      common_cols <- intersect(names(X_tr), names(X_va))
+      X_tr <- X_tr[, common_cols, drop = FALSE]
+      X_va <- X_va[, common_cols, drop = FALSE]
+
+      # Folds degenerados
+      if (ncol(X_tr) == 0 || ncol(X_va) == 0 ||
+          length(unique(y_tr)) < 2 || length(unique(y_va)) < 2) {
+        return(tibble(
+          fold = i, roc_auc = NA_real_, pr_auc = NA_real_,
+          f1 = NA_real_, bal_accuracy = NA_real_, accuracy = NA_real_
+        ))
+      }
+
+      # Entrenar (con retry a lambda=1 si falla)
+      fit  <- try(klaR::rda(x = as.matrix(X_tr), grouping = y_tr,
+                            gamma = gamma, lambda = lambda), silent = TRUE)
+      pred <- if (!inherits(fit, "try-error"))
+        try(predict(fit, newdata = as.matrix(X_va)), silent = TRUE) else "try-error"
+
+      if (inherits(fit, "try-error") || inherits(pred, "try-error")) {
+        fit  <- try(klaR::rda(x = as.matrix(X_tr), grouping = y_tr,
+                              gamma = gamma, lambda = 1), silent = TRUE)
+        pred <- if (!inherits(fit, "try-error"))
+          try(predict(fit, newdata = as.matrix(X_va)), silent = TRUE) else "try-error"
+      }
+
+      if (inherits(fit, "try-error") || inherits(pred, "try-error") ||
+          is.null(pred$posterior) || !"yes" %in% colnames(pred$posterior)) {
+        return(tibble(
+          fold = i, roc_auc = NA_real_, pr_auc = NA_real_,
+          f1 = NA_real_, bal_accuracy = NA_real_, accuracy = NA_real_
+        ))
+      }
+
+      df <- tibble(
+        y = y_va,
+        .pred_yes = as.numeric(pred$posterior[, "yes"]),
+        .pred_class = factor(pred$class, levels = c("yes","no"))
+      )
+
+      tibble(
+        fold = i,
+        roc_auc = roc_auc(df, truth = y, .pred_yes)$.estimate,
+        pr_auc  = pr_auc(df,  truth = y, .pred_yes)$.estimate,
+        f1      = f_meas(df, truth = y, estimate = .pred_class)$.estimate,
+        bal_accuracy = bal_accuracy(df, truth = y, estimate = .pred_class)$.estimate,
+        accuracy = accuracy(df, truth = y, estimate = .pred_class)$.estimate
+      )
+    })
+
+    summary <- per_fold %>%
+      summarise(across(c(roc_auc, pr_auc, f1, bal_accuracy, accuracy),
+                       list(mean = ~{m <- mean(.x, na.rm = TRUE); if (is.nan(m)) NA_real_ else m},
+                            sd   = ~sd(.x, na.rm = TRUE)))) %>%
+      mutate(gamma = gamma, lambda = lambda, .before = 1)
+
+    list(per_fold = per_fold, summary = summary)
+  }
+
+  # PAR: evaluamos la rejilla en paralelo
+  res_list <- future_pmap(
+  .l = list(grid$gamma, grid$lambda),
+  .f = ~ eval_one_combo(..1, ..2),
+  .options = furrr::furrr_options(
+    seed = TRUE,
+    scheduling = 1,
+    packages = c("recipes","klaR","yardstick","dplyr","tibble","rsample")
+  )
+)
+
+  grid_summary <- bind_rows(lapply(res_list, `[[`, "summary")) %>%
+    arrange(desc(roc_auc_mean))
+
+  list(grid_summary = grid_summary, results = res_list)
+}
+rda_out <- cv_rda(folds)
+slice(rda_out$grid_summary, 1)
+```
+To calibrate the Regularized Discriminant Analysis (RDA) model, a cross-validated grid search was performed over a two-dimensional hyperparameter space  ( γ , λ ) (γ,λ), where  γ γ controls the interpolation between LDA and QDA, and  λ λ determines the degree of shrinkage applied to the class-specific covariance matrices. Within each fold, the data were preprocessed using the same recipe applied to all other models (predictor normalization and removal of zero-variance features), ensuring methodological consistency. For every  ( γ , λ ) (γ,λ) combination, an RDA model was trained on the analysis set and evaluated on the assessment set, retrieving posterior probabilities for the positive class. The metrics ROC AUC, PR AUC, F1, balanced accuracy, and accuracy were computed per fold and summarized by their mean and standard deviation. Because certain folds may lead to singular covariance estimates, a fallback mechanism was implemented that automatically retries the model with  λ = 1 λ=1 to ensure numerical stability. Finally, to reduce computational time, the entire grid evaluation was parallelized using future mapping (via the furrr package), allowing each hyperparameter configuration to be processed independently.
