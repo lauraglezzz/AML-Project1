@@ -443,46 +443,56 @@ test  <- test[,  colSums(is.na(test))  < nrow(test)]
 train[sapply(train, is.character)] <- lapply(train[sapply(train, is.character)], as.factor)
 test[sapply(test,  is.character)]  <- lapply(test[sapply(test,  is.character)],  as.factor)
 
-# Create a contrast list only for factor variables
-contr_list_train <- lapply(train[, sapply(train, is.factor), drop = FALSE],
-                           function(x) contrasts(x, contrasts = FALSE))
-contr_list_test  <- lapply(test[, sapply(test, is.factor), drop = FALSE],
-                           function(x) contrasts(x, contrasts = FALSE))
+# Alinear niveles de factores entre train y test (importante para evitar niveles desconocidos)
+for (nm in intersect(names(train), names(test))) {
+  if (is.factor(train[[nm]])) {
+    test[[nm]] <- factor(test[[nm]], levels = levels(train[[nm]]))
+  }
+}
 
-# One-hot encoding (remove intercept)
-X_train <- model.matrix(y ~ ., data = train, contrasts.arg = contr_list_train)[, -1, drop = FALSE]
+# Si quieres mantener objetos tipo X_*/y_* pero sin OHE:
+X_train <- subset(train, select = -y)   # data.frame con factores intactos
 y_train <- train$y
-X_test  <- model.matrix(y ~ ., data = test,  contrasts.arg = contr_list_test)[, -1, drop = FALSE]
+X_test  <- subset(test,  select = -y)
 y_test  <- test$y
 
-cat("Dimensions of X_train:", dim(X_train), "\n")
-cat("Dimensions of X_test :", dim(X_test), "\n")
-table(y_train)
+# "Dimensiones" ahora son de data.frame (filas, columnas)
+cat("Dimensions of X_train:", nrow(X_train), ncol(X_train), "\n")
+cat("Dimensions of X_test :", nrow(X_test),  ncol(X_test),  "\n")
+print(table(y_train))
 
 
 # ============================================================
-# ---  Balance target variable (SMOTE) ---
+# ---  Balance target variable (Oversampling) ---
 # ============================================================
-
-library(smotefamily)
-
-X_train_df  <- as.data.frame(X_train)
-y_train_vec <- as.factor(y_train)
 
 set.seed(123)
-smote_res <- SMOTE(X_train_df, y_train_vec, K = 5, dup_size = 5)
-train_bal <- smote_res$data
-train_bal$class <- factor(train_bal$class, levels = c("no", "yes"))
+
+minority <- train[train$y == "yes", ]
+majority <- train[train$y == "no", ]
+
+# Oversample simple
+n_major <- nrow(majority)
+n_min   <- nrow(minority)
+
+oversampled_minority <- minority[sample(1:n_min, n_major, replace = TRUE), ]
+
+train_bal <- rbind(majority, oversampled_minority)
+
+prop.table(table(train$y))
+prop.table(table(train_bal$y))
+
+train_bal$y <- factor(train_bal$y, levels = c("no", "yes"))
 
 cat("Balanced class proportions:\n")
-print(prop.table(table(train_bal$class)))
+print(prop.table(table(train_bal$y)))
 
 # ============================================================
 # ---  Multicollinearity and redundancy diagnostics ---
 # ============================================================
 
 library(caret)
-X <- model.matrix(class ~ ., data = train_bal)[, -1]
+X <- model.matrix(y ~ ., data = train_bal)[, -1]
 
 kappa_val <- base::kappa(X)
 cat("\nInitial condition number (kappa):", kappa_val, "\n")
@@ -569,5 +579,272 @@ save(test, file = "../artifacts/test.RData")
 save(train_bal, file = "../artifacts/train_bal.RData")
 ```
 
+# Automating the pipeline
 
+```{r}
+# ============================================================
+# PREPROCESSING PIPELINE (fit on train, apply on test) — ready for nested CV
+# ============================================================
+
+suppressPackageStartupMessages({
+  require(caret)
+})
+
+# --- helpers ------------------------------------------------
+
+winsorize_fit <- function(x, p = 0.99) {
+  list(upper = as.numeric(stats::quantile(x, p, na.rm = TRUE)))
+}
+
+winsorize_transform <- function(x, fit) {
+  x2 <- x
+  x2[ x2 > fit$upper ] <- fit$upper
+  x2
+}
+
+zscore_fit <- function(df_num) {
+  list(means = sapply(df_num, mean, na.rm = TRUE),
+       sds   = sapply(df_num,  sd,  na.rm = TRUE))
+}
+zscore_transform <- function(df_num, fit) {
+  scale(df_num, center = fit$means, scale = fit$sds) |> as.data.frame()
+}
+
+align_factor_levels <- function(df, levels_map) {
+  for (nm in names(levels_map)) {
+    if (nm %in% names(df) && is.factor(df[[nm]])) {
+      df[[nm]] <- factor(df[[nm]], levels = levels_map[[nm]])
+    }
+  }
+  df
+}
+
+# --- main function ------------------------------------------
+# df: data.frame completo (con y)
+# train_idx, test_idx: índices (o logical) del fold
+# winsor_ps: percentiles por variable
+preprocess_split <- function(
+  df,
+  train_idx,
+  test_idx,
+  winsor_ps = list(balance = 0.99, duration = 0.99, previous = 0.99, campaign = 0.995),
+  log1p_vars = c("balance", "duration"),
+  remove_cols = c("month"),
+  drop_dummy_if_exists = "poutcomeunknown",
+  seed = 123
+) {
+  set.seed(seed)
+
+  # ----- 1) Partición explícita (nada de split interno)
+  train <- df[train_idx, , drop = FALSE]
+  test  <- df[test_idx,  , drop = FALSE]
+
+  # ----- 2) Limpieza inicial (solo columnas presentes)
+  keep_cols <- setdiff(names(train), intersect(remove_cols, names(train)))
+  train <- train[, keep_cols, drop = FALSE]
+  test  <- test[ , intersect(names(test), keep_cols), drop = FALSE] # asegurar intersección
+
+  # ----- 3) Encoding básico de y y de chars->factor, sin OHE
+  if (!"y" %in% names(train)) stop("Column 'y' not found in training data.")
+  train$y <- factor(train$y, levels = c("no", "yes"))
+  if ("y" %in% names(test)) test$y <- factor(test$y, levels = c("no", "yes"))
+
+  train[sapply(train, is.character)] <- lapply(train[sapply(train, is.character)], as.factor)
+  test[sapply(test,  is.character)]  <- lapply(test[sapply(test,  is.character)],  as.factor)
+
+  # Eliminar columnas constant/NA-full (definido por train) y replicar en test
+  non_all_na <- colSums(is.na(train)) < nrow(train)
+  train <- train[, non_all_na, drop = FALSE]
+  test  <- test[,  intersect(names(test), names(train)), drop = FALSE]
+
+  # Alinear niveles de factores (mapa desde train)
+  levels_map <- list()
+  for (nm in names(train)) {
+    if (is.factor(train[[nm]])) levels_map[[nm]] <- levels(train[[nm]])
+  }
+  test <- align_factor_levels(test, levels_map)
+
+  # ----- 4) Winsorización (ajustar en train, aplicar en ambos)
+  winsor_fits <- list()
+  for (v in intersect(names(winsor_ps), names(train))) {
+    if (is.numeric(train[[v]])) {
+      wfit <- winsorize_fit(train[[v]], p = winsor_ps[[v]])
+      train[[v]] <- winsorize_transform(train[[v]], wfit)
+      if (v %in% names(test)) test[[v]] <- winsorize_transform(test[[v]], wfit)
+      winsor_fits[[v]] <- list(p = winsor_ps[[v]], upper = wfit$upper)
+    }
+  }
+
+  # ----- 5) Log1p variables muy sesgadas (con shift no-neg basado en train)
+  log1p_info <- list()
+  for (v in intersect(log1p_vars, names(train))) {
+    if (is.numeric(train[[v]])) {
+      min_v <- suppressWarnings(min(train[[v]], na.rm = TRUE))
+      shift <- ifelse(is.finite(min_v) && min_v <= 0, -min_v + 1, 0)
+      train[[v]] <- log1p(train[[v]] + shift)
+      if (v %in% names(test)) test[[v]] <- log1p(test[[v]] + shift)
+      log1p_info[[v]] <- list(shift = shift)
+    }
+  }
+
+  # ----- 6) Z-score (fit en train, apply en test)
+  num_vars <- names(train)[sapply(train, is.numeric)]
+  zfit <- zscore_fit(train[, num_vars, drop = FALSE])
+  train[, num_vars] <- zscore_transform(train[, num_vars, drop = FALSE], zfit)
+  if (length(intersect(num_vars, names(test))) > 0) {
+    test[,  intersect(num_vars, names(test))] <-
+      zscore_transform(test[, intersect(num_vars, names(test)), drop = FALSE], zfit)
+  }
+
+  # ----- 7) Construir X/y sin tocar factores (para modelos que acepten factores)
+  X_train <- subset(train, select = -y)
+  y_train <- train$y
+  if ("y" %in% names(test)) {
+    X_test <- subset(test, select = -y)
+    y_test <- test$y
+  } else {
+    X_test <- test
+    y_test <- NULL
+  }
+
+  # ----- 8) Oversampling simple SOLO en train
+  minority <- train[train$y == "yes", , drop = FALSE]
+  majority <- train[train$y == "no",  , drop = FALSE]
+  n_major  <- nrow(majority)
+  n_min    <- nrow(minority)
+  oversampled_minority <- minority[sample(seq_len(n_min), n_major, replace = TRUE), , drop = FALSE]
+  train_bal <- rbind(majority, oversampled_minority)
+  train_bal$y <- factor(train_bal$y, levels = c("no", "yes"))
+
+  X_train_bal <- subset(train_bal, select = -y)
+  y_train_bal <- train_bal$y
+
+  # ----- 9) Diagnósticos de multicolinealidad (opcional; NO afecta transformación)
+  # Se basan en dummies de train_bal, pero no cambiamos los datos salvo que decidas retirar alguna dummy concreta.
+  X_mm <- model.matrix(y ~ ., data = train_bal)[, -1]
+  kappa_initial <- base::kappa(X_mm)
+  nzv_metrics <- nearZeroVar(X_mm, saveMetrics = TRUE)
+  combos <- findLinearCombos(X_mm)
+  cor_mat <- try(stats::cor(X_mm, use = "pairwise.complete.obs"), silent = TRUE)
+  high_cor <- if (inherits(cor_mat, "try-error")) character(0) else findCorrelation(cor_mat, cutoff = 0.95, names = TRUE)
+
+  # Ejemplo de retirar una dummy concreta si existe (coherente con tu script original):
+  removed_cols <- character(0)
+  if (!is.null(drop_dummy_if_exists) && drop_dummy_if_exists %in% colnames(X_mm)) {
+    removed_cols <- c(removed_cols, drop_dummy_if_exists)
+  }
+
+  # Si has decidido retirar alguna columna concreta en base a los diagnósticos, hazlo aquí
+  # (aplicando el MISMO set de columnas a X_train/X_test). Por defecto, solo el ejemplo anterior.
+  if (length(removed_cols)) {
+    # Quitarlas de ambos X_* si existen
+    for (rc in removed_cols) {
+      if (rc %in% names(X_train)) X_train[[rc]] <- NULL
+      if (rc %in% names(X_test))  X_test[[rc]]  <- NULL
+      if (rc %in% names(X_train_bal)) X_train_bal[[rc]] <- NULL
+    }
+  }
+
+  # ----- 10) Salida
+  list(
+    # Datos para entrenar y evaluar
+    X_train      = X_train,
+    y_train      = y_train,
+    X_test       = X_test,
+    y_test       = y_test,
+    X_train_bal  = X_train_bal,
+    y_train_bal  = y_train_bal,
+
+    # Parámetros del “fit” (para reproducibilidad y aplicar a nuevos sets)
+    params = list(
+      removed_initial_cols = setdiff(remove_cols, setdiff(remove_cols, names(df))),
+      winsor_fits = winsor_fits,
+      log1p_info  = log1p_info,
+      zscore_fit  = zfit,
+      factor_levels = levels_map,
+      removed_cols_after_diag = removed_cols
+    ),
+
+    # Logs/diagnósticos
+    diagnostics = list(
+      class_prop_train = prop.table(table(y_train)),
+      class_prop_train_bal = prop.table(table(y_train_bal)),
+      kappa_initial = kappa_initial,
+      nzv = nzv_metrics,
+      high_corr = high_cor
+    )
+  )
+}
+
+```
+
+```{r}
+# ============================================
+# Crear folds externos
+# ============================================
+set.seed(42)
+K <- 5   # cámbialo si quieres otro número de folds
+folds_outer <- caret::createFolds(df$y, k = K, returnTrain = TRUE)
+
+# ============================================
+# Crear listas donde guardar cada fold
+# ============================================
+train_folds <- vector("list", K)
+test_folds  <- vector("list", K)
+
+# ============================================
+# Generar train_fold1, train_fold2, ...
+# ============================================
+for (k in seq_len(K)) {
+  
+  train_idx <- folds_outer[[k]]
+  test_idx  <- setdiff(seq_len(nrow(df)), train_idx)
+  
+  prep <- preprocess_split(
+    df = df,
+    train_idx = train_idx,
+    test_idx = test_idx
+  )
+  
+  # --- Train preprocesado (balanceado)
+  train_folds[[k]] <- list(
+    X_train      = prep$X_train,
+    y_train      = prep$y_train,
+    X_train_bal  = prep$X_train_bal,
+    y_train_bal  = prep$y_train_bal,
+    params       = prep$params,
+    diagnostics  = prep$diagnostics
+  )
+  
+  # --- Test preprocesado
+  test_folds[[k]] <- list(
+    X_test = prep$X_test,
+    y_test = prep$y_test
+  )
+  
+  # --- Crear variables globales tipo train_fold1, train_fold2...
+  assign(
+    paste0("train_fold", k),
+    train_folds[[k]]
+  )
+  
+  assign(
+    paste0("test_fold", k),
+    test_folds[[k]]
+  )
+}
+
+cat("✅ Generados train_fold1 ... train_fold", K, "y los test_fold correspondientes.\n")
+
+```
+
+```{r}
+# como usar en el inner cv?
+# Trabajar con fold 1
+Xtrain  <- train_fold1$X_train_bal
+ytrain  <- train_fold1$y_train_bal
+Xtest   <- test_fold1$X_test
+ytest   <- test_fold1$y_test
+
+```
 

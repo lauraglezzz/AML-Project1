@@ -1,0 +1,306 @@
+---
+title: "Untitled"
+output: html_document
+date: "2025-11-10"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(furrr)
+
+# plan multiprocess = usa todos los núcleos disponibles
+plan(multisession)  # o plan(multicore) en Linux/Mac
+```
+
+First we load the preprocessed train data:
+
+```{r}
+# load preprocessed data
+load("../artifacts/train_bal.RData")
+train <- train_bal
+
+cat("Loaded balanced training set:", nrow(train), "rows,", ncol(train), "columns\n")
+print(prop.table(table(train$y)))
+```
+
+Then we set 5 cross-validation folds.
+
+```{r}
+# K-fold CV on train (stratified)
+folds <- vfold_cv(train, v = 5, strata = y)
+```
+
+```{r}
+library(recipes)
+
+rec_base <- recipe(y ~ ., data = train) %>%
+  step_integer(all_nominal_predictors(), zero_based = TRUE) %>%
+  step_impute_median(all_numeric_predictors()) %>%
+  step_zv(all_predictors()) %>%
+  step_normalize(all_numeric_predictors())
+
+```
+
+```{r}
+library(rsample)
+
+set.seed(123)
+folds <- vfold_cv(train, v = 5, strata = y)
+```
+
+```{r}
+prep_fold_data_liblinear <- function(split) {
+  ana <- analysis(split)
+  ass <- assessment(split)
+
+  rp <- prep(rec_base, training = ana, retain = TRUE)
+  tr <- bake(rp, new_data = ana)
+  va <- bake(rp, new_data = ass)
+
+  y_tr <- factor(tr$y, levels = c("yes","no"))
+  y_va <- factor(va$y, levels = c("yes","no"))
+
+  X_tr <- tr[, setdiff(names(tr), "y"), drop = FALSE]
+  X_va <- va[, setdiff(names(va), "y"), drop = FALSE]
+
+  # convert any leftover factor/logical to numeric safely
+  for (col in names(X_tr)) {
+    if (is.factor(X_tr[[col]]) || is.logical(X_tr[[col]])) {
+      X_tr[[col]] <- as.numeric(X_tr[[col]])
+      X_va[[col]] <- as.numeric(X_va[[col]])
+    }
+  }
+
+  # check two classes present
+  if (nlevels(droplevels(y_tr)) < 2) {
+    return(list(skip = TRUE))
+  }
+
+  list(
+    X_tr = X_tr,
+    y_tr = y_tr,
+    X_va = X_va,
+    y_va = y_va,
+    skip = FALSE
+  )
+}
+
+
+fit_predict_liblinear <- function(X_tr, y_tr, X_va, type = 0, cost = 1, bias = 1, eps = 1e-5) {
+  stopifnot(requireNamespace("LiblineaR", quietly = TRUE))
+
+  X_tr <- as.matrix(X_tr)
+  X_va <- as.matrix(X_va)
+
+  model <- LiblineaR::LiblineaR(
+    data = X_tr,
+    target = y_tr,
+    type = type,
+    cost = cost,
+    bias = bias,
+    epsilon = eps,
+    verbose = FALSE
+  )
+
+  pred <- predict(model, newx = X_va, proba = TRUE)
+  prob <- pred$prob
+  col_yes <- which(colnames(prob) == "yes")
+  if (length(col_yes) == 0) col_yes <- 1
+  as.numeric(prob[, col_yes])
+}
+```
+
+```{r}
+library(yardstick)
+library(tibble)
+
+eval_metrics <- function(y_true, p_hat) {
+  df <- tibble(
+    y = factor(y_true, levels = c("yes", "no")),
+    .pred_yes = p_hat,
+    .pred_class = factor(ifelse(p_hat >= 0.5, "yes", "no"), levels = c("yes", "no"))
+  )
+
+  tibble(
+    roc_auc       = roc_auc(df, truth = y, .pred_yes)$.estimate,
+    pr_auc        = pr_auc(df, truth = y, .pred_yes)$.estimate,
+    f1            = f_meas(df, truth = y, estimate = .pred_class)$.estimate,
+    bal_accuracy  = bal_accuracy(df, truth = y, estimate = .pred_class)$.estimate,
+    accuracy      = accuracy(df, truth = y, estimate = .pred_class)$.estimate
+  )
+}
+
+```
+
+
+```{r}
+library(dplyr)
+library(purrr)
+library(tidyr)
+
+cv_liblinear_grid_parallel <- function(folds, types = c(0,6,7), costs = 2^seq(-5,5)) {
+
+  grid <- tidyr::crossing(type = types, cost = costs)
+
+  run_one <- function(split, type, cost) {
+    fd <- prep_fold_data_liblinear(split)
+    if (isTRUE(fd$skip)) {
+      return(tibble::tibble(
+        type = type, cost = cost,
+        roc_auc = NA, pr_auc = NA, f1 = NA,
+        bal_accuracy = NA, accuracy = NA
+      ))
+    }
+
+    p <- fit_predict_liblinear(
+      fd$X_tr, fd$y_tr, fd$X_va,
+      type = type, cost = cost
+    )
+
+    m <- eval_metrics(fd$y_va, p)
+    bind_cols(tibble(type = type, cost = cost), m)
+  }
+
+  # Parallel run using furrr::future_map_dfr over folds
+  per_fold <- future_map_dfr(folds$splits, function(spl) {
+    pmap_dfr(grid, ~ run_one(spl, ..1, ..2))
+  }, .options = furrr_options(seed = TRUE))
+
+  summary <- per_fold %>%
+    group_by(type, cost) %>%
+    summarise(
+      roc_auc_mean = mean(roc_auc, na.rm = TRUE),
+      pr_auc_mean  = mean(pr_auc, na.rm = TRUE),
+      f1_mean      = mean(f1, na.rm = TRUE),
+      bal_acc_mean = mean(bal_accuracy, na.rm = TRUE),
+      acc_mean     = mean(accuracy, na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    arrange(desc(roc_auc_mean))
+
+  list(per_fold = per_fold, summary = summary)
+}
+
+
+```
+
+```{r}
+res <- cv_liblinear_grid_parallel(
+  folds,
+  types = c(0, 6, 7),
+  costs = 2^seq(-7, 7)
+)
+
+head(res$summary, 10)
+```
+3. Methods
+3.1 Dataset and Preprocessing
+We used the UCI Bank Marketing Dataset \cite{moro2011bank}, which contains demographic and transactional information about clients contacted by a Portuguese bank during a direct marketing campaign. The task is to predict whether a client will subscribe to a term deposit (yes/no).
+To address class imbalance, the dataset was balanced a priori via oversampling of the minority class. All features were retained in their original format, including categorical variables, which were kept as factors and not one-hot encoded. Instead, categorical predictors were encoded using integer mappings via the step_integer() function from the recipes R package. This approach assigns a unique integer to each category without introducing additional dimensions, ensuring compatibility with linear models such as LIBLINEAR while preserving model compactness.
+Numerical features were standardized using z-score normalization. All preprocessing steps, including encoding and normalization, were applied inside the resampling loop (i.e., fold-wise) to prevent information leakage.
+3.2 Model: LIBLINEAR
+We used LIBLINEAR \cite{fan2008liblinear}, a library for large-scale linear classification, to fit logistic regression models with $\ell_1$ and $\ell_2$ regularization. Specifically, we evaluated the following solvers:
+Type 0: $\ell_2$-regularized logistic regression (primal)
+Type 6: $\ell_1$-regularized logistic regression
+Type 7: $\ell_2$-regularized logistic regression (dual)
+All models produce probabilistic outputs and are suitable for large, sparse datasets. The classification threshold was fixed at 0.5 for evaluation purposes.
+3.3 Hyperparameter Tuning and Evaluation
+We performed hyperparameter tuning over the regularization parameter $C \in {2^{-7}, 2^{-6}, \dots, 2^7}$. Each solver (type) was evaluated across this full grid of $15$ cost values. We employed 5-fold stratified cross-validation, resulting in $3 \times 15 \times 5 = 225$ model fits in total.
+Model performance was assessed using the following metrics, computed on the validation fold of each split:
+Area Under the Receiver Operating Characteristic Curve (ROC AUC)
+Area Under the Precision-Recall Curve (PR AUC)
+F1 score (at threshold 0.5)
+Balanced Accuracy
+Overall Accuracy
+The cross-validation procedure was parallelized using the furrr package to reduce computation time.
+3.4 Model Selection and Final Training
+Model selection was based primarily on ROC AUC. In cases where multiple configurations achieved identical performance (up to numerical precision), the model with the smallest cost parameter was preferred to encourage simplicity.
+The final model—a type 0 logistic regression with $C = 4$—was retrained on the entire training dataset using the same preprocessing pipeline. This model was then used to generate probabilistic predictions on the test set.
+
+Elegir el mejor:
+
+```{r}
+library(dplyr)
+
+best_per_type <- res$summary %>%
+  group_by(type) %>%
+  filter(roc_auc_mean == max(roc_auc_mean, na.rm = TRUE)) %>%
+  arrange(desc(roc_auc_mean)) %>%
+  slice(1) %>%  # keep only the top row per type (in case of ties)
+  ungroup()
+
+print(best_per_type)
+```
+```{r}
+best_type <- best_per_type %>%
+  arrange(desc(pr_auc_mean)) %>%
+  slice(1)
+
+print(best_type)
+```
+Entrenamos con el mejor y Predecimos en test:
+
+```{r}
+library(tibble)
+library(yardstick)
+
+# 1. Prepara los datos finales
+rp <- prep(rec_base, training = train, retain = TRUE)
+train_baked <- bake(rp, new_data = train)
+test_baked  <- bake(rp, new_data = test)
+
+X_train <- train_baked[, setdiff(names(train_baked), "y")]
+y_train <- factor(train_baked$y, levels = c("yes", "no"))
+X_test  <- test_baked[, setdiff(names(test_baked), "y")]
+y_test  <- factor(test_baked$y, levels = c("yes", "no"))
+
+X_train <- as.data.frame(lapply(X_train, as.numeric))
+X_test  <- as.data.frame(lapply(X_test, as.numeric))
+
+# 2. Entrena modelo final y cronometra
+start_time <- Sys.time()
+
+model <- LiblineaR::LiblineaR(
+  data = as.matrix(X_train),
+  target = y_train,
+  type = best_type$type,
+  cost = best_type$cost,
+  bias = 1,
+  verbose = FALSE
+)
+
+train_time <- as.numeric(difftime(Sys.time(), start_time, units = "secs"))
+
+# 3. Predicciones
+pred <- predict(model, newx = as.matrix(X_test), proba = TRUE)
+p_yes <- pred$prob[, "yes"]
+pred_class <- ifelse(p_yes >= 0.5, "yes", "no")
+
+# 4. Métricas sobre test
+df <- tibble(
+  truth = y_test,
+  .pred_class = factor(pred_class, levels = c("yes", "no")),
+  .pred_yes = p_yes
+)
+
+# 5. Calcula métricas principales
+acc <- accuracy(df, truth, .pred_class)$.estimate
+f1  <- f_meas(df, truth, .pred_class)$.estimate
+auc <- roc_auc(df, truth, .pred_yes)$.estimate
+
+# 6. Construye tabla final
+method_results <- tibble::tibble(
+  Method        = "LIBLINEAR (type = 0)",
+  Accuracy      = acc,
+  F1_score      = f1,
+  AUC           = auc,
+  Training_time = train_time
+)
+
+print(method_results)
+
+```
+

@@ -27,10 +27,8 @@ First we load the preprocessed train data:
 
 ```{r}
 # load preprocessed data
-load("../artifacts/train.RData")
 load("../artifacts/train_bal.RData")
 train <- train_bal
-if ("class" %in% names(train)) names(train)[names(train) == "class"] <- "y"
 
 cat("Loaded balanced training set:", nrow(train), "rows,", ncol(train), "columns\n")
 print(prop.table(table(train$y)))
@@ -50,8 +48,9 @@ Now will define a base preprocessing recipe.
 rec_base <- recipe(y ~ ., data = train) 
 
 rec_normalize <- recipe(y ~ ., data = train) %>%
-  step_normalize(all_numeric_predictors())  %>%
-  step_dummy(all_nominal_predictors(), one_hot = TRUE) 
+step_integer(all_nominal_predictors(), zero_based = TRUE) %>%  # <-- clave
+  step_zv(all_predictors()) %>%
+  step_normalize(all_numeric_predictors())
 ```
 
 
@@ -487,4 +486,138 @@ cv_rda <- function(folds,
 rda_out <- cv_rda(folds)
 slice(rda_out$grid_summary, 1)
 ```
+
 To calibrate the Regularized Discriminant Analysis (RDA) model, a cross-validated grid search was performed over a two-dimensional hyperparameter space  ( γ , λ ) (γ,λ), where  γ γ controls the interpolation between LDA and QDA, and  λ λ determines the degree of shrinkage applied to the class-specific covariance matrices. Within each fold, the data were preprocessed using the same recipe applied to all other models (predictor normalization and removal of zero-variance features), ensuring methodological consistency. For every  ( γ , λ ) (γ,λ) combination, an RDA model was trained on the analysis set and evaluated on the assessment set, retrieving posterior probabilities for the positive class. The metrics ROC AUC, PR AUC, F1, balanced accuracy, and accuracy were computed per fold and summarized by their mean and standard deviation. Because certain folds may lead to singular covariance estimates, a fallback mechanism was implemented that automatically retries the model with  λ = 1 λ=1 to ensure numerical stability. Finally, to reduce computational time, the entire grid evaluation was parallelized using future mapping (via the furrr package), allowing each hyperparameter configuration to be processed independently.
+
+### Models comparison
+
+```{r}
+# Wilcoxon test: Accuracy
+
+acc_lda <- v_lda$summary$bal_accuracy_mean
+acc_rda <- slice(rda_out$grid_summary, 1)$bal_accuracy_mean
+
+wilcox.test(acc_lda, acc_rda, paired = TRUE, alternative = "two.sided")
+```
+
+```{r}
+# Wilcoxon test: AUC
+
+acc_lda <- v_lda$summary$roc_auc_mean
+acc_rda <- slice(rda_out$grid_summary, 1)$roc_auc_mean
+
+wilcox.test(acc_lda, acc_rda, paired = TRUE, alternative = "two.sided")
+```
+### Other models - Teacher suggestion
+
+```{r}
+# --- CV con LIBLINEAR (logistic) manteniendo tu estructura ---
+cv_liblinear <- function(folds, type = 0, cost = 1, bias = 1, eps = 1e-5) {
+  fold_metrics <- purrr::map(folds$splits, function(spl) {
+    fd <- prep_fold_data_liblinear(spl)            # (1) igual que antes pero devolvemos wi
+    p  <- fit_predict_liblinear(
+      fd$X_tr, fd$y_tr, fd$X_va,
+      wi = fd$wi, type = type, cost = cost, bias = bias, eps = eps
+    )                                              # (2) ajusta y predice probabilidades
+    eval_metrics(fd$y_va, p)                       # (3) métricas (tu helper sirve tal cual)
+  }) %>% dplyr::bind_rows()
+
+  summary <- dplyr::summarise(
+    fold_metrics,
+    dplyr::across(dplyr::everything(), list(mean = mean, sd = sd))
+  )
+
+  list(per_fold = fold_metrics, summary = summary)
+}
+
+# --- Helper 1: preparación por fold para LIBLINEAR ---
+# Igual que el tuyo, pero devolvemos un vector nombrado 'wi' (pesos por clase)
+prep_fold_data_liblinear <- function(split) {
+  ana <- rsample::analysis(split)
+  ass <- rsample::assessment(split)
+
+  rec_prep <- recipes::prep(rec_base, training = ana, retain = TRUE)
+  ana_bake <- recipes::bake(rec_prep, new_data = ana)
+  ass_bake <- recipes::bake(rec_prep, new_data = ass)
+
+  # y con niveles fijos (positivo primero)
+  y_tr <- factor(ana_bake$y, levels = c("yes","no"))
+  X_tr <- dplyr::select(ana_bake, -y)
+
+  y_va <- factor(ass_bake$y, levels = c("yes","no"))
+  X_va <- dplyr::select(ass_bake, -y)
+
+  # pesos por clase (inversa de la frecuencia). LIBLINEAR espera 'wi' con nombres de clase
+  tab <- table(y_tr)
+  w_yes <- as.numeric(sum(tab) / (2 * tab["yes"]))
+  w_no  <- as.numeric(sum(tab) / (2 * tab["no"]))
+  wi    <- c(yes = w_yes, no = w_no)
+
+  list(X_tr = X_tr, y_tr = y_tr, X_va = X_va, y_va = y_va, wi = wi)
+}
+
+# --- Helper 2: ajuste y predicción con LIBLINEAR (logistic) ---
+# Nota:
+# - Necesita matrices numéricas (sin factores); tu recipe debe dejar todo numérico.
+# - Probabilidades solo están disponibles para tipos logísticos (p.ej. type = 0, 6 o 7).
+fit_predict_liblinear <- function(X_tr, y_tr, X_va, wi = NULL,
+                                  type = 0, cost = 1, bias = 1, eps = 1e-5) {
+  stopifnot(requireNamespace("LiblineaR", quietly = TRUE))
+
+  # A LIBLINEAR le va bien recibir 'y' como factor o vector numérico con niveles/clases
+  # Aseguramos matrices numéricas:
+  X_tr_mat <- as.matrix(data.frame(X_tr, check.names = FALSE))
+  X_va_mat <- as.matrix(data.frame(X_va, check.names = FALSE))
+
+  # Ajuste (type=0: L2-regularized logistic (primal); también puedes probar 6 o 7)
+  fit <- LiblineaR::LiblineaR(
+    data = X_tr_mat,
+    target = y_tr,
+    type = type,
+    cost = cost,
+    bias = bias,
+    wi = wi,
+    epsilon = eps,
+    verbose = FALSE
+  )
+
+  # Predicción con probabilidades
+  pred <- predict(fit, newx = X_va_mat, proba = TRUE)
+
+  # 'pred$prob' es una matriz con columnas por clase; cogemos la de "yes"
+  prob_mat <- pred$prob
+  if (is.null(prob_mat)) {
+    stop("Este 'type' de LIBLINEAR no devuelve probabilidades. Usa un tipo logístico (p.ej. 0, 6 o 7).")
+  }
+  col_yes <- which(colnames(prob_mat) == "yes")
+  if (length(col_yes) == 0L) {
+    # Por si los nombres vienen como niveles numéricos; mapeamos usando niveles de y_tr
+    # Buscamos la columna de la clase positiva (primer nivel de y_tr)
+    pos_name <- levels(y_tr)[1]
+    col_yes <- which(colnames(prob_mat) == pos_name)
+  }
+  if (length(col_yes) == 0L) {
+    # fallback: si hay 2 columnas, asumimos que la primera corresponde al primer nivel
+    col_yes <- 1L
+  }
+
+  as.numeric(prob_mat[, col_yes])
+}
+
+rec_base <- recipe(y ~ ., data = train) %>%
+step_integer(all_nominal_predictors(), zero_based = TRUE) %>%  # <-- clave
+  step_zv(all_predictors()) %>%
+  step_normalize(all_numeric_predictors())
+
+# CV con LIBLINEAR logistic (type = 0) y pesos por clase
+v_liblinear <- cv_liblinear(
+  folds,
+  type = 0,   # L2-regularized logistic regression (primal)
+  cost = 1,   # ~ C de SVM; puedes tunearlo
+  bias = 1,
+  eps = 1e-5
+)
+print(v_liblinear$summary)
+```
+
+
