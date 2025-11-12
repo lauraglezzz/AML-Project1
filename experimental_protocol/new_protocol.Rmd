@@ -17,7 +17,7 @@ plan(multisession)  # o plan(multicore) en Linux/Mac
 
 First we load the preprocessed train data:
 
-```{r}
+```
 # load preprocessed data
 load("../artifacts/train_bal.RData")
 train <- train_bal
@@ -28,13 +28,15 @@ print(prop.table(table(train$y)))
 
 Then we set 5 cross-validation folds.
 
-```{r}
+```
+library(rsample)
+library(recipes)
+
 # K-fold CV on train (stratified)
 folds <- vfold_cv(train, v = 5, strata = y)
 ```
 
-```{r}
-library(recipes)
+```
 
 rec_base <- recipe(y ~ ., data = train) %>%
   step_integer(all_nominal_predictors(), zero_based = TRUE) %>%
@@ -44,12 +46,7 @@ rec_base <- recipe(y ~ ., data = train) %>%
 
 ```
 
-```{r}
-library(rsample)
 
-set.seed(123)
-folds <- vfold_cv(train, v = 5, strata = y)
-```
 
 ```{r}
 prep_fold_data_liblinear <- function(split) {
@@ -90,11 +87,10 @@ prep_fold_data_liblinear <- function(split) {
 
 
 fit_predict_liblinear <- function(X_tr, y_tr, X_va, type = 0, cost = 1, bias = 1, eps = 1e-5) {
-  stopifnot(requireNamespace("LiblineaR", quietly = TRUE))
-
   X_tr <- as.matrix(X_tr)
   X_va <- as.matrix(X_va)
-
+  
+  # Entrena modelo
   model <- LiblineaR::LiblineaR(
     data = X_tr,
     target = y_tr,
@@ -104,34 +100,94 @@ fit_predict_liblinear <- function(X_tr, y_tr, X_va, type = 0, cost = 1, bias = 1
     epsilon = eps,
     verbose = FALSE
   )
-
-  pred <- predict(model, newx = X_va, proba = TRUE)
-  prob <- pred$prob
-  col_yes <- which(colnames(prob) == "yes")
-  if (length(col_yes) == 0) col_yes <- 1
-  as.numeric(prob[, col_yes])
+  
+  # Intenta predecir de forma segura
+  pred <- tryCatch({
+    if (type %in% c(0, 6, 7)) {
+      predict(model, newx = X_va, proba = TRUE)
+    } else {
+      predict(model, newx = X_va)
+    }
+  }, error = function(e) NULL)
+  
+  n <- nrow(X_va)
+  
+  # Si no hay predicciones válidas, devolver NA seguras
+  if (is.null(pred) || is.null(pred$predictions) || length(pred$predictions) != n) {
+    return(list(
+      class = factor(rep(NA, n), levels = c("yes", "no")),
+      prob = rep(NA_real_, n),
+      supports_proba = FALSE
+    ))
+  }
+  
+  # Procesa clases (LiblineaR puede devolver numérico o texto)
+  pred_class <- as.character(pred$predictions)
+  pred_class[pred_class %in% c("1")]  <- "yes"
+  pred_class[pred_class %in% c("-1", "0")] <- "no"
+  
+  # Probabilidades solo si existen y son válidas
+  supports_proba <- type %in% c(0, 6, 7) && !is.null(pred$prob)
+  if (supports_proba && "yes" %in% colnames(pred$prob)) {
+    prob <- pred$prob[, "yes"]
+  } else {
+    prob <- rep(NA_real_, n)
+    supports_proba <- FALSE
+  }
+  
+  list(
+    class = factor(pred_class, levels = c("yes", "no")),
+    prob = prob,
+    supports_proba = supports_proba
+  )
 }
+
+
 ```
 
 ```{r}
 library(yardstick)
 library(tibble)
 
-eval_metrics <- function(y_true, p_hat) {
+eval_metrics <- function(y_true, pred_obj) {
+  # Inicializamos como NA por si todo falla
+  n <- length(y_true)
+  pred_class <- pred_obj$class
+  pred_prob  <- pred_obj$prob
+
+  # Si class no es válido o tiene longitud distinta, forzamos a NA
+  if (is.null(pred_class) || length(pred_class) != n) {
+    pred_class <- rep(NA_character_, n)
+  }
+
   df <- tibble(
     y = factor(y_true, levels = c("yes", "no")),
-    .pred_yes = p_hat,
-    .pred_class = factor(ifelse(p_hat >= 0.5, "yes", "no"), levels = c("yes", "no"))
+    .pred_class = factor(pred_class, levels = c("yes", "no"))
   )
 
-  tibble(
-    roc_auc       = roc_auc(df, truth = y, .pred_yes)$.estimate,
-    pr_auc        = pr_auc(df, truth = y, .pred_yes)$.estimate,
-    f1            = f_meas(df, truth = y, estimate = .pred_class)$.estimate,
-    bal_accuracy  = bal_accuracy(df, truth = y, estimate = .pred_class)$.estimate,
-    accuracy      = accuracy(df, truth = y, estimate = .pred_class)$.estimate
+  base_metrics <- tibble(
+    f1           = f_meas(df, truth = y, estimate = .pred_class)$.estimate,
+    bal_accuracy = bal_accuracy(df, truth = y, estimate = .pred_class)$.estimate,
+    accuracy     = accuracy(df, truth = y, estimate = .pred_class)$.estimate
   )
+
+  # AUC/PR AUC solo si hay probabilidades válidas
+  if (isTRUE(pred_obj$supports_proba) && !is.null(pred_prob) && length(pred_prob) == n) {
+    df$.pred_yes <- pred_prob
+    auc_metrics <- tibble(
+      roc_auc = roc_auc(df, truth = y, .pred_yes)$.estimate,
+      pr_auc  = pr_auc(df, truth = y, .pred_yes)$.estimate
+    )
+  } else {
+    auc_metrics <- tibble(
+      roc_auc = NA_real_,
+      pr_auc  = NA_real_
+    )
+  }
+
+  bind_cols(base_metrics, auc_metrics)
 }
+
 
 ```
 
@@ -141,9 +197,15 @@ library(dplyr)
 library(purrr)
 library(tidyr)
 
-cv_liblinear_grid_parallel <- function(folds, types = c(0,6,7), costs = 2^seq(-5,5)) {
+cv_liblinear_grid_parallel <- function(folds, types = c(0, 6, 7), costs = 2^seq(-5, 5)) {
+  
+  splits <- folds$splits
 
-  grid <- tidyr::crossing(type = types, cost = costs)
+  grid <- expand_grid(
+    split_id = seq_along(splits),
+    type = types,
+    cost = costs
+  )
 
   run_one <- function(split, type, cost) {
     fd <- prep_fold_data_liblinear(split)
@@ -164,9 +226,8 @@ cv_liblinear_grid_parallel <- function(folds, types = c(0,6,7), costs = 2^seq(-5
     bind_cols(tibble(type = type, cost = cost), m)
   }
 
-  # Parallel run using furrr::future_map_dfr over folds
-  per_fold <- future_map_dfr(folds$splits, function(spl) {
-    pmap_dfr(grid, ~ run_one(spl, ..1, ..2))
+  per_fold <- future_pmap_dfr(grid, function(split_id, type, cost) {
+    run_one(splits[[split_id]], type, cost)
   }, .options = furrr_options(seed = TRUE))
 
   summary <- per_fold %>%
@@ -179,23 +240,454 @@ cv_liblinear_grid_parallel <- function(folds, types = c(0,6,7), costs = 2^seq(-5
       acc_mean     = mean(accuracy, na.rm = TRUE),
       .groups = "drop"
     ) %>%
-    arrange(desc(roc_auc_mean))
+    arrange(desc(f1_mean), cost)
 
   list(per_fold = per_fold, summary = summary)
 }
 
 
+
 ```
+
+
+
+# Automating the pipeline
 
 ```{r}
-res <- cv_liblinear_grid_parallel(
-  folds,
-  types = c(0, 6, 7),
-  costs = 2^seq(-7, 7)
+# ============================================================
+# PREPROCESSING PIPELINE (fit on train, apply on test) — ready for nested CV
+# ============================================================
+
+suppressPackageStartupMessages({
+  require(caret)
+})
+
+# --- helpers ------------------------------------------------
+
+winsorize_fit <- function(x, p = 0.99) {
+  list(upper = as.numeric(stats::quantile(x, p, na.rm = TRUE)))
+}
+
+winsorize_transform <- function(x, fit) {
+  x2 <- x
+  x2[ x2 > fit$upper ] <- fit$upper
+  x2
+}
+
+zscore_fit <- function(df_num) {
+  list(means = sapply(df_num, mean, na.rm = TRUE),
+       sds   = sapply(df_num,  sd,  na.rm = TRUE))
+}
+zscore_transform <- function(df_num, fit) {
+  scale(df_num, center = fit$means, scale = fit$sds) |> as.data.frame()
+}
+
+align_factor_levels <- function(df, levels_map) {
+  for (nm in names(levels_map)) {
+    if (nm %in% names(df) && is.factor(df[[nm]])) {
+      df[[nm]] <- factor(df[[nm]], levels = levels_map[[nm]])
+    }
+  }
+  df
+}
+
+# --- main function ------------------------------------------
+# df: data.frame completo (con y)
+# train_idx, test_idx: índices (o logical) del fold
+# winsor_ps: percentiles por variable
+preprocess_split <- function(
+  df,
+  train_idx,
+  test_idx,
+  winsor_ps = list(balance = 0.99, duration = 0.99, previous = 0.99, campaign = 0.995),
+  log1p_vars = c("balance", "duration"),
+  remove_cols = c("month"),
+  drop_dummy_if_exists = "poutcomeunknown",
+  seed = 123
+) {
+  set.seed(seed)
+
+  # ----- 1) Partición explícita (nada de split interno)
+  train <- df[train_idx, , drop = FALSE]
+  test  <- df[test_idx,  , drop = FALSE]
+
+  # ----- 2) Limpieza inicial (solo columnas presentes)
+  keep_cols <- setdiff(names(train), intersect(remove_cols, names(train)))
+  train <- train[, keep_cols, drop = FALSE]
+  test  <- test[ , intersect(names(test), keep_cols), drop = FALSE] # asegurar intersección
+
+  # ----- 3) Encoding básico de y y de chars->factor, sin OHE
+  if (!"y" %in% names(train)) stop("Column 'y' not found in training data.")
+  train$y <- factor(train$y, levels = c("no", "yes"))
+  if ("y" %in% names(test)) test$y <- factor(test$y, levels = c("no", "yes"))
+
+  train[sapply(train, is.character)] <- lapply(train[sapply(train, is.character)], as.factor)
+  test[sapply(test,  is.character)]  <- lapply(test[sapply(test,  is.character)],  as.factor)
+
+  # Eliminar columnas constant/NA-full (definido por train) y replicar en test
+  non_all_na <- colSums(is.na(train)) < nrow(train)
+  train <- train[, non_all_na, drop = FALSE]
+  test  <- test[,  intersect(names(test), names(train)), drop = FALSE]
+
+  # Alinear niveles de factores (mapa desde train)
+  levels_map <- list()
+  for (nm in names(train)) {
+    if (is.factor(train[[nm]])) levels_map[[nm]] <- levels(train[[nm]])
+  }
+  test <- align_factor_levels(test, levels_map)
+
+  # ----- 4) Winsorización (ajustar en train, aplicar en ambos)
+  winsor_fits <- list()
+  for (v in intersect(names(winsor_ps), names(train))) {
+    if (is.numeric(train[[v]])) {
+      wfit <- winsorize_fit(train[[v]], p = winsor_ps[[v]])
+      train[[v]] <- winsorize_transform(train[[v]], wfit)
+      if (v %in% names(test)) test[[v]] <- winsorize_transform(test[[v]], wfit)
+      winsor_fits[[v]] <- list(p = winsor_ps[[v]], upper = wfit$upper)
+    }
+  }
+
+  # ----- 5) Log1p variables muy sesgadas (con shift no-neg basado en train)
+  log1p_info <- list()
+  for (v in intersect(log1p_vars, names(train))) {
+    if (is.numeric(train[[v]])) {
+      min_v <- suppressWarnings(min(train[[v]], na.rm = TRUE))
+      shift <- ifelse(is.finite(min_v) && min_v <= 0, -min_v + 1, 0)
+      train[[v]] <- log1p(train[[v]] + shift)
+      if (v %in% names(test)) test[[v]] <- log1p(test[[v]] + shift)
+      log1p_info[[v]] <- list(shift = shift)
+    }
+  }
+
+  # ----- 6) Z-score (fit en train, apply en test)
+  num_vars <- names(train)[sapply(train, is.numeric)]
+  zfit <- zscore_fit(train[, num_vars, drop = FALSE])
+  train[, num_vars] <- zscore_transform(train[, num_vars, drop = FALSE], zfit)
+  if (length(intersect(num_vars, names(test))) > 0) {
+    test[,  intersect(num_vars, names(test))] <-
+      zscore_transform(test[, intersect(num_vars, names(test)), drop = FALSE], zfit)
+  }
+
+  # ----- 7) Construir X/y sin tocar factores (para modelos que acepten factores)
+  X_train <- subset(train, select = -y)
+  y_train <- train$y
+  if ("y" %in% names(test)) {
+    X_test <- subset(test, select = -y)
+    y_test <- test$y
+  } else {
+    X_test <- test
+    y_test <- NULL
+  }
+
+  # ----- 8) Oversampling simple SOLO en train
+  minority <- train[train$y == "yes", , drop = FALSE]
+  majority <- train[train$y == "no",  , drop = FALSE]
+  n_major  <- nrow(majority)
+  n_min    <- nrow(minority)
+  oversampled_minority <- minority[sample(seq_len(n_min), n_major, replace = TRUE), , drop = FALSE]
+  train_bal <- rbind(majority, oversampled_minority)
+  train_bal$y <- factor(train_bal$y, levels = c("no", "yes"))
+
+  X_train_bal <- subset(train_bal, select = -y)
+  y_train_bal <- train_bal$y
+
+  # ----- 9) Diagnósticos de multicolinealidad (opcional; NO afecta transformación)
+  # Se basan en dummies de train_bal, pero no cambiamos los datos salvo que decidas retirar alguna dummy concreta.
+  X_mm <- model.matrix(y ~ ., data = train_bal)[, -1]
+  kappa_initial <- base::kappa(X_mm)
+  nzv_metrics <- nearZeroVar(X_mm, saveMetrics = TRUE)
+  combos <- findLinearCombos(X_mm)
+  cor_mat <- try(stats::cor(X_mm, use = "pairwise.complete.obs"), silent = TRUE)
+  high_cor <- if (inherits(cor_mat, "try-error")) character(0) else findCorrelation(cor_mat, cutoff = 0.95, names = TRUE)
+
+  # Ejemplo de retirar una dummy concreta si existe (coherente con tu script original):
+  removed_cols <- character(0)
+  if (!is.null(drop_dummy_if_exists) && drop_dummy_if_exists %in% colnames(X_mm)) {
+    removed_cols <- c(removed_cols, drop_dummy_if_exists)
+  }
+
+  # Si has decidido retirar alguna columna concreta en base a los diagnósticos, hazlo aquí
+  # (aplicando el MISMO set de columnas a X_train/X_test). Por defecto, solo el ejemplo anterior.
+  if (length(removed_cols)) {
+    # Quitarlas de ambos X_* si existen
+    for (rc in removed_cols) {
+      if (rc %in% names(X_train)) X_train[[rc]] <- NULL
+      if (rc %in% names(X_test))  X_test[[rc]]  <- NULL
+      if (rc %in% names(X_train_bal)) X_train_bal[[rc]] <- NULL
+    }
+  }
+
+  # ----- 10) Salida
+  list(
+    # Datos para entrenar y evaluar
+    X_train      = X_train,
+    y_train      = y_train,
+    X_test       = X_test,
+    y_test       = y_test,
+    X_train_bal  = X_train_bal,
+    y_train_bal  = y_train_bal,
+
+    # Parámetros del “fit” (para reproducibilidad y aplicar a nuevos sets)
+    params = list(
+      removed_initial_cols = setdiff(remove_cols, setdiff(remove_cols, names(df))),
+      winsor_fits = winsor_fits,
+      log1p_info  = log1p_info,
+      zscore_fit  = zfit,
+      factor_levels = levels_map,
+      removed_cols_after_diag = removed_cols
+    ),
+
+    # Logs/diagnósticos
+    diagnostics = list(
+      class_prop_train = prop.table(table(y_train)),
+      class_prop_train_bal = prop.table(table(y_train_bal)),
+      kappa_initial = kappa_initial,
+      nzv = nzv_metrics,
+      high_corr = high_cor
+    )
+  )
+}
+
+```
+
+Load dataset and create dataframe
+```{r}
+df <- read.csv("../data/bank-full.csv",
+               sep = ";")
+```
+
+
+```{r}
+# ============================================
+# Crear folds externos
+# ============================================
+set.seed(42)
+K <- 5   # cámbialo si quieres otro número de folds
+folds_outer <- caret::createFolds(df$y, k = K, returnTrain = TRUE)
+
+# ============================================
+# Crear listas donde guardar cada fold
+# ============================================
+train_folds <- vector("list", K)
+test_folds  <- vector("list", K)
+
+# ============================================
+# Generar train_fold1, train_fold2, ...
+# ============================================
+for (k in seq_len(K)) {
+  
+  train_idx <- folds_outer[[k]]
+  test_idx  <- setdiff(seq_len(nrow(df)), train_idx)
+  
+  prep <- preprocess_split(
+    df = df,
+    train_idx = train_idx,
+    test_idx = test_idx
+  )
+  
+  # --- Train preprocesado (balanceado)
+  train_folds[[k]] <- list(
+    X_train      = prep$X_train,
+    y_train      = prep$y_train,
+    X_train_bal  = prep$X_train_bal,
+    y_train_bal  = prep$y_train_bal,
+    params       = prep$params,
+    diagnostics  = prep$diagnostics
+  )
+  
+  # --- Test preprocesado
+  test_folds[[k]] <- list(
+    X_test = prep$X_test,
+    y_test = prep$y_test
+  )
+  
+  # --- Crear variables globales tipo train_fold1, train_fold2...
+  assign(
+    paste0("train_fold", k),
+    train_folds[[k]]
+  )
+  
+  assign(
+    paste0("test_fold", k),
+    test_folds[[k]]
+  )
+}
+
+cat("✅ Generados train_fold1 ... train_fold", K, "y los test_fold correspondientes.\n")
+
+```
+
+
+```{r}
+library(dplyr)
+library(tibble)
+library(purrr)
+library(rsample)
+library(yardstick)
+library(LiblineaR)
+library(recipes)
+library(furrr)
+
+plan(multisession)  # o multicore en Linux/macOS
+
+# ===============================
+# 1. Nested CV Loop
+# ===============================
+K <- 1  # número de folds externos
+outer_results <- vector("list", K)
+
+for (k in seq_len(K)) {
+  cat("\n================== OUTER FOLD", k, "==================\n")
+  
+  # ---------------------------
+  # Datos del fold k
+  # ---------------------------
+  train_bal <- cbind(get(paste0("train_fold", k))$X_train_bal,
+                     y = get(paste0("train_fold", k))$y_train_bal)
+  
+  test_set <- cbind(get(paste0("test_fold", k))$X_test,
+                    y = get(paste0("test_fold", k))$y_test)
+  rec_base <- recipe(y ~ ., data = train_bal) %>%
+    step_integer(all_nominal_predictors(), zero_based = TRUE) %>%
+    step_impute_median(all_numeric_predictors()) %>%
+    step_zv(all_predictors()) %>%
+    step_normalize(all_numeric_predictors())
+
+  # Alinear niveles de factores entre train/test (si fuera necesario)
+  for (col in intersect(names(train_bal), names(test_set))) {
+    if (is.factor(train_bal[[col]])) {
+      test_set[[col]] <- factor(test_set[[col]], levels = levels(train_bal[[col]]))
+    }
+  }
+  
+  # ---------------------------
+  # 2. INNER CV - tuning por tipo y coste
+  # ---------------------------
+  set.seed(42 + k)
+  inner_folds <- vfold_cv(train_bal, v = 5, strata = y)
+  
+  grid_res <- cv_liblinear_grid_parallel(
+  inner_folds,
+  types = c(0, 6, 7, 1),
+  costs = 2^seq(-5, 5)
+)
+  
+ best_type <- grid_res$summary %>%
+  filter(f1_mean == max(f1_mean, na.rm = TRUE)) %>%
+  arrange(cost) %>%  # desempate por menor coste
+  slice(1)
+
+  cat("Mejor tipo para fold", k, "-> type =", best_type$type,
+    "| cost =", best_type$cost, "\n")
+  
+  # ---------------------------
+  # 3. Entrenamiento final
+  # ---------------------------
+  rec_final <- prep(rec_base, training = train_bal, retain = TRUE)
+  
+  train_baked <- bake(rec_final, new_data = train_bal)
+  test_baked  <- bake(rec_final, new_data = test_set)
+
+  X_train <- train_baked[, setdiff(names(train_baked), "y")]
+  y_train <- factor(train_baked$y, levels = c("yes", "no"))
+  X_test  <- test_baked[, setdiff(names(test_baked), "y")]
+  y_test  <- factor(test_baked$y, levels = c("yes", "no"))
+
+  # Convertir todo a numérico (sin warning)
+  X_train <- as.data.frame(lapply(X_train, as.numeric))
+  X_test  <- as.data.frame(lapply(X_test,  as.numeric))
+  
+  start_time <- Sys.time()
+  model <- LiblineaR::LiblineaR(
+    data = as.matrix(X_train),
+    target = y_train,
+    type = best_type$type,
+    cost = best_type$cost,
+    bias = 1,
+    verbose = FALSE
+  )
+  train_time <- as.numeric(difftime(Sys.time(), start_time, units = "secs"))
+  
+  # ---------------------------
+# 4. Predicción y evaluación
+# ---------------------------
+pred <- tryCatch({
+  predict(model, newx = as.matrix(X_test), proba = (best_type$type %in% c(0, 6, 7)))
+}, error = function(e) NULL)
+
+n <- nrow(X_test)
+
+if (is.null(pred)) {
+  # Fallback en caso de error total
+  p_yes <- rep(NA_real_, n)
+  pred_class <- rep(NA_character_, n)
+} else if (!is.null(pred$prob) && "yes" %in% colnames(pred$prob)) {
+  # Modelos logísticos (0,6,7)
+  p_yes <- pred$prob[, "yes"]
+  pred_class <- ifelse(p_yes >= 0.5, "yes", "no")
+} else if (!is.null(pred$predictions)) {
+  # Modelos sin probabilidad (1,3,4,5)
+  raw_pred <- as.character(pred$predictions)
+  raw_pred[raw_pred %in% c("1")]  <- "yes"
+  raw_pred[raw_pred %in% c("-1", "0")] <- "no"
+  pred_class <- raw_pred
+  p_yes <- rep(NA_real_, n)
+} else {
+  # fallback absoluto
+  pred_class <- rep(NA_character_, n)
+  p_yes <- rep(NA_real_, n)
+}
+
+df <- tibble(
+  truth = factor(y_test, levels = c("yes", "no")),
+  .pred_class = factor(pred_class, levels = c("yes", "no")),  # <-- Alineación correcta
+  .pred_yes = p_yes
 )
 
-head(res$summary, 10)
+
+  metrics <- tibble(
+    Fold          = k,
+    Accuracy      = accuracy(df, truth, .pred_class)$.estimate,
+    F1_score      = f_meas(df, truth, .pred_class)$.estimate,
+    ROC_AUC       = roc_auc(df, truth, .pred_yes)$.estimate,
+    PR_AUC        = pr_auc(df, truth, .pred_yes)$.estimate,
+    Bal_Accuracy  = bal_accuracy(df, truth, .pred_class)$.estimate,
+    Training_time = train_time,
+    Best_type     = best_type$type,
+    Best_cost     = best_type$cost
+  )
+  
+  outer_results[[k]] <- metrics
+}
+
+# ===============================
+# 5. Resultado final
+# ===============================
+final_results <- bind_rows(outer_results) %>%
+  mutate(Fold = as.character(Fold))
+
+summary_row <- final_results |>
+  summarise(
+    Fold = "Mean",
+    Accuracy     = mean(Accuracy),
+    F1_score     = mean(F1_score),
+    ROC_AUC      = mean(ROC_AUC),
+    PR_AUC       = mean(PR_AUC),
+    Bal_Accuracy = mean(Bal_Accuracy),
+    Training_time = mean(Training_time),
+    Best_type = NA,
+  )
+
+final_summary <- bind_rows(final_results, summary_row)
+
+cat("\n========== RESULTADOS NESTED CV ==========\n")
+print(final_summary)
+
 ```
+
+En este proyecto abordamos el problema de predicción sobre el conjunto de datos de marketing bancario de la UCI, aplicando un enfoque riguroso basado en validación cruzada anidada para evaluar modelos de clasificación. Nos centramos inicialmente en modelos lineales implementados con LIBLINEAR, una librería eficiente para problemas de clasificación a gran escala. En concreto, exploramos distintas variantes de regresión logística penalizada (tipos 0, 6 y 7) junto con una búsqueda sobre el hiperparámetro de regularización cost, evaluando cada configuración mediante métricas como ROC AUC, F1-score y Accuracy. Todo el preprocesamiento se realizó dentro de los folds, aplicando transformaciones como step_integer, imputación y normalización, evitando así cualquier fuga de información. Este enfoque permite seleccionar el mejor tipo de modelo y regularización para cada fold, ofreciendo una evaluación realista y generalizable. Si bien el foco estuvo en modelos lineales por su interpretabilidad y rendimiento, en una segunda fase incorporaremos modelos adicionales como árboles de decisión y Naive Bayes para enriquecer la comparación y fortalecer la narrativa de resultados.
+
+
 3. Methods
 3.1 Dataset and Preprocessing
 We used the UCI Bank Marketing Dataset \cite{moro2011bank}, which contains demographic and transactional information about clients contacted by a Portuguese bank during a direct marketing campaign. The task is to predict whether a client will subscribe to a term deposit (yes/no).
@@ -220,87 +712,7 @@ The cross-validation procedure was parallelized using the furrr package to reduc
 Model selection was based primarily on ROC AUC. In cases where multiple configurations achieved identical performance (up to numerical precision), the model with the smallest cost parameter was preferred to encourage simplicity.
 The final model—a type 0 logistic regression with $C = 4$—was retrained on the entire training dataset using the same preprocessing pipeline. This model was then used to generate probabilistic predictions on the test set.
 
-Elegir el mejor:
 
-```{r}
-library(dplyr)
-
-best_per_type <- res$summary %>%
-  group_by(type) %>%
-  filter(roc_auc_mean == max(roc_auc_mean, na.rm = TRUE)) %>%
-  arrange(desc(roc_auc_mean)) %>%
-  slice(1) %>%  # keep only the top row per type (in case of ties)
-  ungroup()
-
-print(best_per_type)
-```
-```{r}
-best_type <- best_per_type %>%
-  arrange(desc(pr_auc_mean)) %>%
-  slice(1)
-
-print(best_type)
-```
-Entrenamos con el mejor y Predecimos en test:
-
-```{r}
-library(tibble)
-library(yardstick)
-
-# 1. Prepara los datos finales
-rp <- prep(rec_base, training = train, retain = TRUE)
-train_baked <- bake(rp, new_data = train)
-test_baked  <- bake(rp, new_data = test)
-
-X_train <- train_baked[, setdiff(names(train_baked), "y")]
-y_train <- factor(train_baked$y, levels = c("yes", "no"))
-X_test  <- test_baked[, setdiff(names(test_baked), "y")]
-y_test  <- factor(test_baked$y, levels = c("yes", "no"))
-
-X_train <- as.data.frame(lapply(X_train, as.numeric))
-X_test  <- as.data.frame(lapply(X_test, as.numeric))
-
-# 2. Entrena modelo final y cronometra
-start_time <- Sys.time()
-
-model <- LiblineaR::LiblineaR(
-  data = as.matrix(X_train),
-  target = y_train,
-  type = best_type$type,
-  cost = best_type$cost,
-  bias = 1,
-  verbose = FALSE
-)
-
-train_time <- as.numeric(difftime(Sys.time(), start_time, units = "secs"))
-
-# 3. Predicciones
-pred <- predict(model, newx = as.matrix(X_test), proba = TRUE)
-p_yes <- pred$prob[, "yes"]
-pred_class <- ifelse(p_yes >= 0.5, "yes", "no")
-
-# 4. Métricas sobre test
-df <- tibble(
-  truth = y_test,
-  .pred_class = factor(pred_class, levels = c("yes", "no")),
-  .pred_yes = p_yes
-)
-
-# 5. Calcula métricas principales
-acc <- accuracy(df, truth, .pred_class)$.estimate
-f1  <- f_meas(df, truth, .pred_class)$.estimate
-auc <- roc_auc(df, truth, .pred_yes)$.estimate
-
-# 6. Construye tabla final
-method_results <- tibble::tibble(
-  Method        = "LIBLINEAR (type = 0)",
-  Accuracy      = acc,
-  F1_score      = f1,
-  AUC           = auc,
-  Training_time = train_time
-)
-
-print(method_results)
-
-```
-
+COSAS POR HACER:
+- reportar metricas en training tambien
+- naive bayes y decision tree 
