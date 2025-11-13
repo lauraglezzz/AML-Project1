@@ -10,302 +10,32 @@ knitr::opts_chunk$set(echo = TRUE)
 
 ```{r}
 library(furrr)
-
-# plan multiprocess = usa todos los núcleos disponibles
-plan(multisession)  # o plan(multicore) en Linux/Mac
-```
-
-First we load the preprocessed train data:
-
-```
-# load preprocessed data
-load("../artifacts/train_bal.RData")
-train <- train_bal
-
-cat("Loaded balanced training set:", nrow(train), "rows,", ncol(train), "columns\n")
-print(prop.table(table(train$y)))
-```
-
-Then we set 5 cross-validation folds.
-
-```
-library(rsample)
-library(recipes)
-
-# K-fold CV on train (stratified)
-folds <- vfold_cv(train, v = 5, strata = y)
-```
-
-```
-
-rec_base <- recipe(y ~ ., data = train) %>%
-  step_integer(all_nominal_predictors(), zero_based = TRUE) %>%
-  step_impute_median(all_numeric_predictors()) %>%
-  step_zv(all_predictors()) %>%
-  step_normalize(all_numeric_predictors())
-
-```
-
-
-
-```{r}
-prep_fold_data_liblinear <- function(split) {
-  ana <- analysis(split)
-  ass <- assessment(split)
-
-  rp <- prep(rec_base, training = ana, retain = TRUE)
-  tr <- bake(rp, new_data = ana)
-  va <- bake(rp, new_data = ass)
-
-  y_tr <- factor(tr$y, levels = c("yes","no"))
-  y_va <- factor(va$y, levels = c("yes","no"))
-
-  X_tr <- tr[, setdiff(names(tr), "y"), drop = FALSE]
-  X_va <- va[, setdiff(names(va), "y"), drop = FALSE]
-
-  # convert any leftover factor/logical to numeric safely
-  for (col in names(X_tr)) {
-    if (is.factor(X_tr[[col]]) || is.logical(X_tr[[col]])) {
-      X_tr[[col]] <- as.numeric(X_tr[[col]])
-      X_va[[col]] <- as.numeric(X_va[[col]])
-    }
-  }
-
-  # check two classes present
-  if (nlevels(droplevels(y_tr)) < 2) {
-    return(list(skip = TRUE))
-  }
-
-  list(
-    X_tr = X_tr,
-    y_tr = y_tr,
-    X_va = X_va,
-    y_va = y_va,
-    skip = FALSE
-  )
-}
-
-
-fit_predict_liblinear <- function(X_tr, y_tr, X_va, type = 0, cost = 1, bias = 1, eps = 1e-5) {
-  X_tr <- as.matrix(X_tr)
-  X_va <- as.matrix(X_va)
-  
-  # Entrena modelo
-  model <- LiblineaR::LiblineaR(
-    data = X_tr,
-    target = y_tr,
-    type = type,
-    cost = cost,
-    bias = bias,
-    epsilon = eps,
-    verbose = FALSE
-  )
-  
-  # Intenta predecir de forma segura
-  pred <- tryCatch({
-    if (type %in% c(0, 6, 7)) {
-      predict(model, newx = X_va, proba = TRUE)
-    } else {
-      predict(model, newx = X_va)
-    }
-  }, error = function(e) NULL)
-  
-  n <- nrow(X_va)
-  
-  # Si no hay predicciones válidas, devolver NA seguras
-  if (is.null(pred) || is.null(pred$predictions) || length(pred$predictions) != n) {
-    return(list(
-      class = factor(rep(NA, n), levels = c("yes", "no")),
-      prob = rep(NA_real_, n),
-      supports_proba = FALSE
-    ))
-  }
-  
-  # Procesa clases (LiblineaR puede devolver numérico o texto)
-  pred_class <- as.character(pred$predictions)
-  pred_class[pred_class %in% c("1")]  <- "yes"
-  pred_class[pred_class %in% c("-1", "0")] <- "no"
-  
-  # Probabilidades solo si existen y son válidas
-  supports_proba <- type %in% c(0, 6, 7) && !is.null(pred$prob)
-  if (supports_proba && "yes" %in% colnames(pred$prob)) {
-    prob <- pred$prob[, "yes"]
-  } else {
-    prob <- rep(NA_real_, n)
-    supports_proba <- FALSE
-  }
-  
-  list(
-    class = factor(pred_class, levels = c("yes", "no")),
-    prob = prob,
-    supports_proba = supports_proba
-  )
-}
-
-
-```
-
-```{r}
+library(future)
 library(yardstick)
 library(tibble)
-
-eval_metrics <- function(y_true, pred_obj) {
-  # Inicializamos como NA por si todo falla
-  n <- length(y_true)
-  pred_class <- pred_obj$class
-  pred_prob  <- pred_obj$prob
-
-  # Si class no es válido o tiene longitud distinta, forzamos a NA
-  if (is.null(pred_class) || length(pred_class) != n) {
-    pred_class <- rep(NA_character_, n)
-  }
-
-  df <- tibble(
-    y = factor(y_true, levels = c("yes", "no")),
-    .pred_class = factor(pred_class, levels = c("yes", "no"))
-  )
-
-  base_metrics <- tibble(
-    f1           = f_meas(df, truth = y, estimate = .pred_class)$.estimate,
-    bal_accuracy = bal_accuracy(df, truth = y, estimate = .pred_class)$.estimate,
-    accuracy     = accuracy(df, truth = y, estimate = .pred_class)$.estimate
-  )
-
-  # AUC/PR AUC solo si hay probabilidades válidas
-  if (isTRUE(pred_obj$supports_proba) && !is.null(pred_prob) && length(pred_prob) == n) {
-    df$.pred_yes <- pred_prob
-    auc_metrics <- tibble(
-      roc_auc = roc_auc(df, truth = y, .pred_yes)$.estimate,
-      pr_auc  = pr_auc(df, truth = y, .pred_yes)$.estimate
-    )
-  } else {
-    auc_metrics <- tibble(
-      roc_auc = NA_real_,
-      pr_auc  = NA_real_
-    )
-  }
-
-  bind_cols(base_metrics, auc_metrics)
-}
-
-
-```
-
-
-```{r}
 library(dplyr)
 library(purrr)
 library(tidyr)
+require(caret)
+library(rsample)
+library(LiblineaR)
+library(recipes)
+library(e1071)
+library(rpart)
 
-cv_liblinear_grid_parallel <- function(folds, types = c(0, 6, 7), costs = 2^seq(-5, 5)) {
-  
-  splits <- folds$splits
-
-  grid <- expand_grid(
-    split_id = seq_along(splits),
-    type = types,
-    cost = costs
-  )
-
-  run_one <- function(split, type, cost) {
-    fd <- prep_fold_data_liblinear(split)
-    if (isTRUE(fd$skip)) {
-      return(tibble::tibble(
-        type = type, cost = cost,
-        roc_auc = NA, pr_auc = NA, f1 = NA,
-        bal_accuracy = NA, accuracy = NA
-      ))
-    }
-
-    p <- fit_predict_liblinear(
-      fd$X_tr, fd$y_tr, fd$X_va,
-      type = type, cost = cost
-    )
-
-    m <- eval_metrics(fd$y_va, p)
-    bind_cols(tibble(type = type, cost = cost), m)
-  }
-
-  per_fold <- future_pmap_dfr(grid, function(split_id, type, cost) {
-    run_one(splits[[split_id]], type, cost)
-  }, .options = furrr_options(seed = TRUE))
-
-  summary <- per_fold %>%
-    group_by(type, cost) %>%
-    summarise(
-      roc_auc_mean = mean(roc_auc, na.rm = TRUE),
-      pr_auc_mean  = mean(pr_auc, na.rm = TRUE),
-      f1_mean      = mean(f1, na.rm = TRUE),
-      bal_acc_mean = mean(bal_accuracy, na.rm = TRUE),
-      acc_mean     = mean(accuracy, na.rm = TRUE),
-      .groups = "drop"
-    ) %>%
-    arrange(desc(f1_mean), cost)
-
-  list(per_fold = per_fold, summary = summary)
-}
-
-
-
+plan(multisession)
 ```
 
+## Preparing the data
 
-
-# Automating the pipeline
+In this step we prepare the 5 outer folds. For each fold, the preprocessing pipeline is fitted on the training set and then applied to the corresponding test set. This ensures that every outer fold is processed independently and is ready for the modelling phase.
 
 ```{r}
 # ============================================================
-# PREPROCESSING PIPELINE (fit on train, apply on test) — ready for nested CV
+# PREPROCESSING PIPELINE (fit on train, apply on test) 
 # ============================================================
 
-suppressPackageStartupMessages({
-  require(caret)
-})
-
-# --- helpers ------------------------------------------------
-
-winsorize_fit <- function(x, p = 0.99) {
-  list(upper = as.numeric(stats::quantile(x, p, na.rm = TRUE)))
-}
-
-winsorize_transform <- function(x, fit) {
-  x2 <- x
-  x2[ x2 > fit$upper ] <- fit$upper
-  x2
-}
-
-zscore_fit <- function(df_num) {
-  list(means = sapply(df_num, mean, na.rm = TRUE),
-       sds   = sapply(df_num,  sd,  na.rm = TRUE))
-}
-zscore_transform <- function(df_num, fit) {
-  scale(df_num, center = fit$means, scale = fit$sds) |> as.data.frame()
-}
-
-align_factor_levels <- function(df, levels_map) {
-  for (nm in names(levels_map)) {
-    if (nm %in% names(df) && is.factor(df[[nm]])) {
-      df[[nm]] <- factor(df[[nm]], levels = levels_map[[nm]])
-    }
-  }
-  df
-}
-
-# --- main function ------------------------------------------
-# df: data.frame completo (con y)
-# train_idx, test_idx: índices (o logical) del fold
-# winsor_ps: percentiles por variable
-preprocess_split <- function(
-  df,
-  train_idx,
-  test_idx,
-  winsor_ps = list(balance = 0.99, duration = 0.99, previous = 0.99, campaign = 0.995),
-  log1p_vars = c("balance", "duration"),
-  remove_cols = c("month"),
-  drop_dummy_if_exists = "poutcomeunknown",
-  seed = 123
-) {
-  set.seed(seed)
+preprocess_split <- function(df, train_idx, test_idx, remove_cols = c("month")) {
 
   # ----- 1) Partición explícita (nada de split interno)
   train <- df[train_idx, , drop = FALSE]
@@ -317,9 +47,8 @@ preprocess_split <- function(
   test  <- test[ , intersect(names(test), keep_cols), drop = FALSE] # asegurar intersección
 
   # ----- 3) Encoding básico de y y de chars->factor, sin OHE
-  if (!"y" %in% names(train)) stop("Column 'y' not found in training data.")
   train$y <- factor(train$y, levels = c("no", "yes"))
-  if ("y" %in% names(test)) test$y <- factor(test$y, levels = c("no", "yes"))
+  test$y <- factor(test$y, levels = c("no", "yes"))
 
   train[sapply(train, is.character)] <- lapply(train[sapply(train, is.character)], as.factor)
   test[sapply(test,  is.character)]  <- lapply(test[sapply(test,  is.character)],  as.factor)
@@ -334,39 +63,120 @@ preprocess_split <- function(
   for (nm in names(train)) {
     if (is.factor(train[[nm]])) levels_map[[nm]] <- levels(train[[nm]])
   }
-  test <- align_factor_levels(test, levels_map)
+  
+  # Alinear niveles de factores del test con los del train
+  for (col in names(train)) {
+    if (col %in% names(test) && is.factor(train[[col]])) {
+      test[[col]] <- factor(test[[col]], levels = levels(train[[col]]))
+    }
+  }
+
 
   # ----- 4) Winsorización (ajustar en train, aplicar en ambos)
-  winsor_fits <- list()
-  for (v in intersect(names(winsor_ps), names(train))) {
+  # ---------- Winsorize + Z-score (simple, claro, sin helpers) ----------
+  
+  # Percentil elegido para winsorización
+  p <- 0.99
+  
+  # Variables numéricas en común
+  vars_num <- intersect(names(train), names(test))
+  
+  # Listas donde guardaremos los parámetros aprendidos
+  winsor_limits <- list()
+  z_means  <- list()
+  z_sds    <- list()
+  
+  for (v in vars_num) {
     if (is.numeric(train[[v]])) {
-      wfit <- winsorize_fit(train[[v]], p = winsor_ps[[v]])
-      train[[v]] <- winsorize_transform(train[[v]], wfit)
-      if (v %in% names(test)) test[[v]] <- winsorize_transform(test[[v]], wfit)
-      winsor_fits[[v]] <- list(p = winsor_ps[[v]], upper = wfit$upper)
+  
+      # ----- 1) Winsorización (solo aprende del TRAIN)
+      upper_lim <- quantile(train[[v]], probs = p, na.rm = TRUE)
+  
+      # guardamos el límite
+      winsor_limits[[v]] <- upper_lim
+  
+      # aplicar winsorizing en train
+      train[[v]][ train[[v]] > upper_lim ] <- upper_lim
+  
+      # aplicar el *mismo* límite en test
+      test[[v]][ test[[v]] > upper_lim ] <- upper_lim
+  
+      # ----- 2) Z-score (solo aprende del TRAIN)
+      mu <- mean(train[[v]], na.rm = TRUE)
+      sdv <- sd(train[[v]], na.rm = TRUE)
+  
+      # guardar valores
+      z_means[[v]] <- mu
+      z_sds[[v]] <- sdv
+  
+      # transformar train
+      train[[v]] <- (train[[v]] - mu) / sdv
+  
+      # transformar test
+      test[[v]] <- (test[[v]] - mu) / sdv
     }
   }
+
 
   # ----- 5) Log1p variables muy sesgadas (con shift no-neg basado en train)
-  log1p_info <- list()
-  for (v in intersect(log1p_vars, names(train))) {
-    if (is.numeric(train[[v]])) {
-      min_v <- suppressWarnings(min(train[[v]], na.rm = TRUE))
-      shift <- ifelse(is.finite(min_v) && min_v <= 0, -min_v + 1, 0)
-      train[[v]] <- log1p(train[[v]] + shift)
-      if (v %in% names(test)) test[[v]] <- log1p(test[[v]] + shift)
-      log1p_info[[v]] <- list(shift = shift)
+  # ---------- Log-transform (simple, claro, estilo limpio) ----------
+  
+  # Variables que queremos transformar con log1p
+  vars_log <- c("balance", "duration")
+  
+  for (v in vars_log) {
+    if (v %in% names(train)) {
+  
+      # 1) Ajustar mínimos solo con TRAIN (para que todo sea >= 1 antes del log)
+      min_v <- min(train[[v]], na.rm = TRUE)
+  
+      if (min_v <= 0) {
+  
+        # desplazamos ambos (train y test) usando el mínimo aprendido
+        train[[v]] <- train[[v]] - min_v + 1
+  
+        if (v %in% names(test)) {
+          test[[v]] <- test[[v]] - min_v + 1
+        }
+      }
+  
+      # 2) Aplicar log1p en ambos
+      train[[v]] <- log1p(train[[v]])
+  
+      if (v %in% names(test)) {
+        test[[v]]  <- log1p(test[[v]])
+      }
     }
   }
 
+
   # ----- 6) Z-score (fit en train, apply en test)
-  num_vars <- names(train)[sapply(train, is.numeric)]
-  zfit <- zscore_fit(train[, num_vars, drop = FALSE])
-  train[, num_vars] <- zscore_transform(train[, num_vars, drop = FALSE], zfit)
-  if (length(intersect(num_vars, names(test))) > 0) {
-    test[,  intersect(num_vars, names(test))] <-
-      zscore_transform(test[, intersect(num_vars, names(test)), drop = FALSE], zfit)
-  }
+  # ---------- Z-score normalization (simple, claro, sin helpers) ----------
+
+# Seleccionar las variables numéricas (presentes en ambos datasets)
+num_vars <- intersect(
+  names(train)[sapply(train, is.numeric)],
+  names(test)
+)
+
+# Aprender medias y SD usando SOLO TRAIN
+z_means <- sapply(train[, num_vars, drop = FALSE], mean, na.rm = TRUE)
+z_sds   <- sapply(train[, num_vars, drop = FALSE], sd,   na.rm = TRUE)
+
+# Transformar TRAIN con los parámetros aprendidos
+train[, num_vars] <- scale(
+  train[, num_vars, drop = FALSE],
+  center = z_means,
+  scale  = z_sds
+)
+
+# Transformar TEST con esos mismos parámetros
+test[, num_vars] <- scale(
+  test[, num_vars, drop = FALSE],
+  center = z_means,
+  scale  = z_sds
+)
+
 
   # ----- 7) Construir X/y sin tocar factores (para modelos que acepten factores)
   X_train <- subset(train, select = -y)
@@ -391,32 +201,6 @@ preprocess_split <- function(
   X_train_bal <- subset(train_bal, select = -y)
   y_train_bal <- train_bal$y
 
-  # ----- 9) Diagnósticos de multicolinealidad (opcional; NO afecta transformación)
-  # Se basan en dummies de train_bal, pero no cambiamos los datos salvo que decidas retirar alguna dummy concreta.
-  X_mm <- model.matrix(y ~ ., data = train_bal)[, -1]
-  kappa_initial <- base::kappa(X_mm)
-  nzv_metrics <- nearZeroVar(X_mm, saveMetrics = TRUE)
-  combos <- findLinearCombos(X_mm)
-  cor_mat <- try(stats::cor(X_mm, use = "pairwise.complete.obs"), silent = TRUE)
-  high_cor <- if (inherits(cor_mat, "try-error")) character(0) else findCorrelation(cor_mat, cutoff = 0.95, names = TRUE)
-
-  # Ejemplo de retirar una dummy concreta si existe (coherente con tu script original):
-  removed_cols <- character(0)
-  if (!is.null(drop_dummy_if_exists) && drop_dummy_if_exists %in% colnames(X_mm)) {
-    removed_cols <- c(removed_cols, drop_dummy_if_exists)
-  }
-
-  # Si has decidido retirar alguna columna concreta en base a los diagnósticos, hazlo aquí
-  # (aplicando el MISMO set de columnas a X_train/X_test). Por defecto, solo el ejemplo anterior.
-  if (length(removed_cols)) {
-    # Quitarlas de ambos X_* si existen
-    for (rc in removed_cols) {
-      if (rc %in% names(X_train)) X_train[[rc]] <- NULL
-      if (rc %in% names(X_test))  X_test[[rc]]  <- NULL
-      if (rc %in% names(X_train_bal)) X_train_bal[[rc]] <- NULL
-    }
-  }
-
   # ----- 10) Salida
   list(
     # Datos para entrenar y evaluar
@@ -425,44 +209,21 @@ preprocess_split <- function(
     X_test       = X_test,
     y_test       = y_test,
     X_train_bal  = X_train_bal,
-    y_train_bal  = y_train_bal,
-
-    # Parámetros del “fit” (para reproducibilidad y aplicar a nuevos sets)
-    params = list(
-      removed_initial_cols = setdiff(remove_cols, setdiff(remove_cols, names(df))),
-      winsor_fits = winsor_fits,
-      log1p_info  = log1p_info,
-      zscore_fit  = zfit,
-      factor_levels = levels_map,
-      removed_cols_after_diag = removed_cols
-    ),
-
-    # Logs/diagnósticos
-    diagnostics = list(
-      class_prop_train = prop.table(table(y_train)),
-      class_prop_train_bal = prop.table(table(y_train_bal)),
-      kappa_initial = kappa_initial,
-      nzv = nzv_metrics,
-      high_corr = high_cor
-    )
+    y_train_bal  = y_train_bal
   )
 }
 
 ```
 
-Load dataset and create dataframe
-```{r}
-df <- read.csv("../data/bank-full.csv",
-               sep = ";")
-```
-
-
 ```{r}
 # ============================================
 # Crear folds externos
 # ============================================
+df <- read.csv("../data/bank-full.csv",
+               sep = ";")
+
 set.seed(42)
-K <- 5   # cámbialo si quieres otro número de folds
+K <- 5   
 folds_outer <- caret::createFolds(df$y, k = K, returnTrain = TRUE)
 
 # ============================================
@@ -512,29 +273,207 @@ for (k in seq_len(K)) {
     test_folds[[k]]
   )
 }
+```
 
-cat("✅ Generados train_fold1 ... train_fold", K, "y los test_fold correspondientes.\n")
+```{r}
+summary(train_fold1)
+```
+
+## Modeling
+
+```{r}
+prep_fold_data_liblinear <- function(split) {
+  ana <- analysis(split)
+  ass <- assessment(split)
+
+  rp <- prep(rec_base, training = ana, retain = TRUE)
+  tr <- bake(rp, new_data = ana)
+  va <- bake(rp, new_data = ass)
+
+  y_tr <- factor(tr$y, levels = c("yes","no"))
+  y_va <- factor(va$y, levels = c("yes","no"))
+
+  X_tr <- tr[, setdiff(names(tr), "y"), drop = FALSE]
+  X_va <- va[, setdiff(names(va), "y"), drop = FALSE]
+
+  list(
+    X_tr = X_tr,
+    y_tr = y_tr,
+    X_va = X_va,
+    y_va = y_va,
+    skip = FALSE
+  )
+}
+
+
+fit_predict_liblinear <- function(X_tr, y_tr, X_va,
+                                  type = 0, cost = 1) {
+  
+  X_tr <- as.matrix(X_tr)
+  X_va <- as.matrix(X_va)
+  
+  # ----- Entrenamiento -----
+  model <- LiblineaR::LiblineaR(
+    data = X_tr,
+    target = y_tr,
+    type = type,
+    cost = cost,
+    verbose = FALSE
+  )
+  
+  # ----- Predicción -----
+  pred <- predict(model, newx = X_va, proba = TRUE, decisionValues = TRUE)
+      
+  n <- nrow(X_va)
+  
+  # ----- Convertir predicciones numéricas a etiquetas yes/no -----
+  pred_class <- as.character(pred$predictions)
+  pred_class[pred_class %in% c("1")]  <- "yes"
+  pred_class[pred_class %in% c("-1", "0")] <- "no"
+  
+  # ----- Probabilidades (solo logistic regression) -----
+  prob <- pred$prob[, "yes"]
+ 
+  
+  list(
+    class = factor(pred_class, levels = c("yes", "no")),
+    prob = prob            
+  )
+}
+
+```
+
+```{r}
+eval_metrics <- function(y_true, pred_obj) {
+  # Inicializamos como NA por si todo falla
+  n <- length(y_true)
+  pred_class <- pred_obj$class
+  pred_prob  <- pred_obj$prob
+
+
+  df <- tibble(
+    y = factor(y_true, levels = c("yes", "no")),
+    .pred_class = factor(pred_class, levels = c("yes", "no"))
+  )
+
+  base_metrics <- tibble(
+    f1           = f_meas(df, truth = y, estimate = .pred_class)$.estimate,
+    bal_accuracy = bal_accuracy(df, truth = y, estimate = .pred_class)$.estimate,
+    accuracy     = accuracy(df, truth = y, estimate = .pred_class)$.estimate
+  )
+
+ 
+    df$.pred_yes <- pred_prob
+    auc_metrics <- tibble(
+      roc_auc = roc_auc(df, truth = y, .pred_yes)$.estimate,
+      pr_auc  = pr_auc(df, truth = y, .pred_yes)$.estimate
+    )
+ 
+
+  bind_cols(base_metrics, auc_metrics)
+}
+
+cv_liblinear_grid_parallel <- function(folds, types = c(0, 6, 7), costs = 2^seq(-5, 5)) {
+  
+  splits <- folds$splits
+
+  grid <- expand_grid(
+    split_id = seq_along(splits),
+    type = types,
+    cost = costs
+  )
+
+  run_one <- function(split, type, cost) {
+    # 1) Preparar datos del fold
+    fd <- prep_fold_data_liblinear(split)
+    
+    # 2) Entrenar y predecir (train → validation)
+    p <- fit_predict_liblinear(
+      fd$X_tr, fd$y_tr, fd$X_va,
+      type = type, cost = cost
+    )
+    
+    # 3) Evaluar métricas estándar (usa tu eval_metrics robusta)
+    m <- eval_metrics(fd$y_va, p)
+    
+    # 4) Optimizar threshold SOLO si hay probabilidades válidas
+    pred_prob <- p$prob
+    
+    # threshold óptimo que maximiza F1
+    th_opt <- optimize_threshold(fd$y_va, pred_prob)$best_th
+      
+    # 5) Devolver todo junto
+    bind_cols(
+      tibble(type = type, cost = cost, th = th_opt),
+      m
+    )
+  }
+
+
+  per_fold <- future_pmap_dfr(grid, function(split_id, type, cost) {
+    run_one(splits[[split_id]], type, cost)
+  }, .options = furrr_options(seed = TRUE))
+
+  summary <- per_fold %>%
+    group_by(type, cost) %>%
+    summarise(
+      roc_auc_mean = mean(roc_auc, na.rm = TRUE),
+      pr_auc_mean  = mean(pr_auc, na.rm = TRUE),
+      f1_mean      = mean(f1, na.rm = TRUE),
+      bal_acc_mean = mean(bal_accuracy, na.rm = TRUE),
+      acc_mean     = mean(accuracy, na.rm = TRUE),
+      th_mean      = mean(th, na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    arrange(desc(f1_mean), cost)
+
+  list(per_fold = per_fold, summary = summary)
+}
+
+optimize_threshold <- function(y_true, prob, metric = "f1") {
+  # grid de thresholds posibles
+  ths <- seq(0, 1, by = 0.01)
+  
+  best_th <- 0.5
+  best_val <- -Inf
+  
+  for (th in ths) {
+    pred_class <- factor(ifelse(prob >= th, "yes", "no"),
+                         levels = c("yes","no"))
+    
+    df <- tibble(
+      y = factor(y_true, levels = c("yes","no")),
+      .pred_class = pred_class
+    )
+    
+    f1_val <- f_meas(df, truth = y, estimate = .pred_class,
+                     event_level = "first")$.estimate
+    
+    if (!is.na(f1_val) && f1_val > best_val) {
+      best_val <- f1_val
+      best_th <- th
+    }
+  }
+  
+  list(best_th = best_th, best_f1 = best_val)
+}
 
 ```
 
 
+
+
+
+Run all the pipeline:
+
 ```{r}
-library(dplyr)
-library(tibble)
-library(purrr)
-library(rsample)
-library(yardstick)
-library(LiblineaR)
-library(recipes)
-library(furrr)
-
-plan(multisession)  # o multicore en Linux/macOS
-
 # ===============================
 # 1. Nested CV Loop
 # ===============================
-K <- 1  # número de folds externos
+K <- 1 
 outer_results <- vector("list", K)
+train_results <- vector("list", K)
+
 
 for (k in seq_len(K)) {
   cat("\n================== OUTER FOLD", k, "==================\n")
@@ -549,33 +488,27 @@ for (k in seq_len(K)) {
                     y = get(paste0("test_fold", k))$y_test)
   rec_base <- recipe(y ~ ., data = train_bal) %>%
     step_integer(all_nominal_predictors(), zero_based = TRUE) %>%
-    step_impute_median(all_numeric_predictors()) %>%
-    step_zv(all_predictors()) %>%
     step_normalize(all_numeric_predictors())
-
-  # Alinear niveles de factores entre train/test (si fuera necesario)
-  for (col in intersect(names(train_bal), names(test_set))) {
-    if (is.factor(train_bal[[col]])) {
-      test_set[[col]] <- factor(test_set[[col]], levels = levels(train_bal[[col]]))
-    }
-  }
   
   # ---------------------------
   # 2. INNER CV - tuning por tipo y coste
   # ---------------------------
+  start_time <- Sys.time()
   set.seed(42 + k)
   inner_folds <- vfold_cv(train_bal, v = 5, strata = y)
   
-  grid_res <- cv_liblinear_grid_parallel(
-  inner_folds,
-  types = c(0, 6, 7, 1),
-  costs = 2^seq(-5, 5)
-)
-  
- best_type <- grid_res$summary %>%
-  filter(f1_mean == max(f1_mean, na.rm = TRUE)) %>%
-  arrange(cost) %>%  # desempate por menor coste
-  slice(1)
+    grid_res <- cv_liblinear_grid_parallel(
+    folds = inner_folds,
+    types = 7,#c(0, 6, 7),
+    costs = 2 # 2^seq(-5, 5)
+  )
+    
+   best_type <- grid_res$summary %>%
+    filter(f1_mean == max(f1_mean, na.rm = TRUE)) %>%
+    arrange(cost) %>%  # desempate por menor coste
+    slice(1)
+   
+   best_threshold <- best_type$th_mean
 
   cat("Mejor tipo para fold", k, "-> type =", best_type$type,
     "| cost =", best_type$cost, "\n")
@@ -597,7 +530,7 @@ for (k in seq_len(K)) {
   X_train <- as.data.frame(lapply(X_train, as.numeric))
   X_test  <- as.data.frame(lapply(X_test,  as.numeric))
   
-  start_time <- Sys.time()
+  
   model <- LiblineaR::LiblineaR(
     data = as.matrix(X_train),
     target = y_train,
@@ -609,110 +542,251 @@ for (k in seq_len(K)) {
   train_time <- as.numeric(difftime(Sys.time(), start_time, units = "secs"))
   
   # ---------------------------
-# 4. Predicción y evaluación
-# ---------------------------
-pred <- tryCatch({
-  predict(model, newx = as.matrix(X_test), proba = (best_type$type %in% c(0, 6, 7)))
-}, error = function(e) NULL)
+  # 4. Predicción y evaluación
+  # ---------------------------
+  pred <- predict(model, newx = as.matrix(X_test), proba = (best_type$type %in% c(0, 6, 7)))
 
-n <- nrow(X_test)
-
-if (is.null(pred)) {
-  # Fallback en caso de error total
-  p_yes <- rep(NA_real_, n)
-  pred_class <- rep(NA_character_, n)
-} else if (!is.null(pred$prob) && "yes" %in% colnames(pred$prob)) {
-  # Modelos logísticos (0,6,7)
-  p_yes <- pred$prob[, "yes"]
-  pred_class <- ifelse(p_yes >= 0.5, "yes", "no")
-} else if (!is.null(pred$predictions)) {
-  # Modelos sin probabilidad (1,3,4,5)
-  raw_pred <- as.character(pred$predictions)
-  raw_pred[raw_pred %in% c("1")]  <- "yes"
-  raw_pred[raw_pred %in% c("-1", "0")] <- "no"
-  pred_class <- raw_pred
-  p_yes <- rep(NA_real_, n)
-} else {
-  # fallback absoluto
-  pred_class <- rep(NA_character_, n)
-  p_yes <- rep(NA_real_, n)
-}
-
-df <- tibble(
-  truth = factor(y_test, levels = c("yes", "no")),
-  .pred_class = factor(pred_class, levels = c("yes", "no")),  # <-- Alineación correcta
-  .pred_yes = p_yes
-)
-
-
+  n <- nrow(X_test)
+  
+    p_yes <- pred$prob[, "yes"]
+    pred_class <- ifelse(p_yes >= best_threshold, "yes", "no")
+  
+  
+  
+  df <- tibble(
+    truth = factor(y_test, levels = c("yes", "no")),
+    .pred_class = factor(pred_class, levels = c("yes", "no")),  
+    .pred_yes = p_yes
+  )
+  
+  # report metrics in test
   metrics <- tibble(
     Fold          = k,
     Accuracy      = accuracy(df, truth, .pred_class)$.estimate,
     F1_score      = f_meas(df, truth, .pred_class)$.estimate,
     ROC_AUC       = roc_auc(df, truth, .pred_yes)$.estimate,
-    PR_AUC        = pr_auc(df, truth, .pred_yes)$.estimate,
     Bal_Accuracy  = bal_accuracy(df, truth, .pred_class)$.estimate,
-    Training_time = train_time,
-    Best_type     = best_type$type,
-    Best_cost     = best_type$cost
+    Training_time = train_time
   )
   
-  outer_results[[k]] <- metrics
+  # report metrics in training
+  # Predicción en el TRAIN del outer fold (modelo final ya entrenado)
+  pred_train <- predict(model, newx = as.matrix(X_train), proba = (best_type$type %in% c(0,6,7)))
+
+  # Extraer clase
+    p_yes_train <- pred_train$prob[, "yes"]
+    class_train <- ifelse(p_yes_train >= 0.5, "yes", "no")
+
+  df_lin_train <- tibble(
+    truth       = factor(y_train, levels = c("yes","no")),
+    .pred_class = factor(class_train, levels = c("yes","no")),
+    .pred_yes   = p_yes_train
+  )
+  
+  metrics_liblinear_train <- tibble(
+    Fold         = k,
+    Model        = "LIBLINEAR",
+    Split        = "train",
+    Accuracy     = accuracy(df_lin_train, truth, .pred_class)$.estimate,
+    F1_score     = f_meas(df_lin_train, truth, .pred_class)$.estimate,
+    ROC_AUC      = roc_auc(df_lin_train, truth, .pred_yes)$.estimate,
+    Bal_Accuracy = bal_accuracy(df_lin_train, truth, .pred_class)$.estimate,
+    Best_type    = best_type$type,
+    Best_cost    = best_type$cost
+  )
+  
+  # ===========================
+  # 5. NAIVE BAYES (no tuning)
+  # ===========================
+  
+  # Entrenamiento NB sobre datos ya preprocesados con la misma receta
+  nb_model <- naiveBayes(
+    x = X_train,
+    y = y_train,
+    laplace = 0  # por defecto
+  )
+  
+  # Predicción probabilística
+  nb_pred <- predict(nb_model, X_test, type = "raw")
+  nb_class <- predict(nb_model, X_test)
+  
+  df_nb <- tibble(
+    truth = factor(y_test, levels = c("yes","no")),
+    .pred_class = factor(nb_class, levels = c("yes","no")),
+    .pred_yes = nb_pred[,"yes"]
+  )
+  
+  metrics_nb <- tibble(
+    Fold          = k,
+    Model         = "NaiveBayes",
+    Accuracy      = accuracy(df_nb, truth, .pred_class)$.estimate,
+    F1_score      = f_meas(df_nb, truth, .pred_class)$.estimate,
+    ROC_AUC       = roc_auc(df_nb, truth, .pred_yes)$.estimate,
+    Bal_Accuracy  = bal_accuracy(df_nb, truth, .pred_class)$.estimate
+  )
+  
+  nb_pred_train  <- predict(nb_model, X_train, type = "raw")
+  nb_class_train <- predict(nb_model, X_train)
+  
+  df_nb_train <- tibble(
+    truth = factor(y_train, levels = c("yes","no")),
+    .pred_class = factor(nb_class_train, levels = c("yes","no")),
+    .pred_yes   = nb_pred_train[,"yes"]
+  )
+  
+  metrics_train_nb <- tibble(
+    Fold         = k,
+    Model        = "NaiveBayes",
+    Accuracy     = accuracy(df_nb_train, truth, .pred_class)$.estimate,
+    F1_score     = f_meas(df_nb_train, truth, .pred_class)$.estimate,
+    ROC_AUC      = roc_auc(df_nb_train, truth, .pred_yes)$.estimate,
+    Bal_Accuracy = bal_accuracy(df_nb_train, truth, .pred_class)$.estimate
+  )
+  
+  # ===============================
+  # 6. DECISION TREE (tuning cp)
+  # ===============================
+  
+  
+  # Grid ligero para cp
+  cp_grid <- c(0.0001, 0.001, 0.01, 0.05, 0.1)
+  
+  # Inner CV SOLO para cp (rápido)
+  dt_inner_res <- vector("list", length(cp_grid))
+  
+  inner_folds_dt <- vfold_cv(train_baked, v = 5, strata = y)
+  
+  for (i in seq_along(cp_grid)) {
+    cp_val <- cp_grid[i]
+    fold_metrics <- c()
+    
+    for (fold in inner_folds_dt$splits) {
+      tr_dt <- analysis(fold)
+      va_dt <- assessment(fold)
+      
+      # Entrenar árbol
+      dt_model <- rpart(
+        y ~ ., 
+        data = tr_dt,
+        method = "class",
+        control = rpart.control(cp = cp_val)
+      )
+      
+      # Predicción probabilística
+      pred_dt <- predict(dt_model, va_dt, type = "prob")[, "yes"]
+      pred_class <- ifelse(pred_dt >= 0.5, "yes", "no")
+      
+      df_dt <- tibble(
+        truth = factor(va_dt$y, levels = c("yes","no")),
+        .pred_class = factor(pred_class, levels = c("yes","no")),
+        .pred_yes = pred_dt
+      )
+      
+      fold_metrics <- c(fold_metrics, roc_auc(df_dt, truth, .pred_yes)$.estimate)
+    }
+    
+    dt_inner_res[[i]] <- tibble(cp = cp_val, auc = mean(fold_metrics))
+  }
+  
+  dt_inner_res <- bind_rows(dt_inner_res)
+  
+  # Seleccionar mejor cp (máx AUC)
+  best_cp <- dt_inner_res$cp[which.max(dt_inner_res$auc)]
+  cat("Mejor cp para Decision Tree:", best_cp, "\n")
+  
+  # Entrenamiento final del árbol sobre TODO el training
+  dt_model_final <- rpart(
+    y ~ ., 
+    data = train_baked,
+    method = "class",
+    control = rpart.control(cp = best_cp)
+  )
+  
+  # Predicción en test externo
+  dt_pred <- predict(dt_model_final, test_baked, type = "prob")[, "yes"]
+  dt_class <- ifelse(dt_pred >= 0.5, "yes", "no")
+  
+  df_dt_test <- tibble(
+    truth = factor(y_test, levels = c("yes","no")),
+    .pred_class = factor(dt_class, levels = c("yes","no")),
+    .pred_yes = dt_pred
+  )
+  
+  metrics_dt <- tibble(
+    Fold          = k,
+    Model         = "DecisionTree",
+    Accuracy      = accuracy(df_dt_test, truth, .pred_class)$.estimate,
+    F1_score      = f_meas(df_dt_test, truth, .pred_class)$.estimate,
+    ROC_AUC       = roc_auc(df_dt_test, truth, .pred_yes)$.estimate,
+    Bal_Accuracy  = bal_accuracy(df_dt_test, truth, .pred_class)$.estimate,
+    Best_cp       = best_cp
+  )
+  
+  # train metrics
+  
+  dt_pred_train  <- predict(dt_model_final, train_baked, type = "prob")[, "yes"]
+  dt_class_train <- ifelse(dt_pred_train >= 0.5, "yes", "no")
+  
+  df_dt_train <- tibble(
+    truth = factor(y_train, levels = c("yes","no")),
+    .pred_class = factor(dt_class_train, levels = c("yes","no")),
+    .pred_yes = dt_pred_train
+  )
+  
+  metrics_train_dt <- tibble(
+    Fold         = k,
+    Model        = "DecisionTree",
+    Accuracy     = accuracy(df_dt_train, truth, .pred_class)$.estimate,
+    F1_score     = f_meas(df_dt_train, truth, .pred_class)$.estimate,
+    ROC_AUC      = roc_auc(df_dt_train, truth, .pred_yes)$.estimate,
+    Bal_Accuracy = bal_accuracy(df_dt_train, truth, .pred_class)$.estimate,
+    Best_cp      = best_cp
+  )
+    
+  #########################
+  ### Save summary results 
+  ##########################
+  
+  outer_results[[k]] <- bind_rows(
+    metrics |> mutate(Model = "LIBLINEAR"),
+    metrics_nb,
+    metrics_dt
+  )
+  
+  train_results[[k]] <- bind_rows(
+    metrics_train_liblinear,
+    metrics_train_nb,
+    metrics_train_dt
+  )
 }
 
 # ===============================
 # 5. Resultado final
 # ===============================
-final_results <- bind_rows(outer_results) %>%
-  mutate(Fold = as.character(Fold))
+cat("\n========== TRAIN RESULTS ==========\n")
+final_results <- bind_rows(train_results)
+print(final_results)
 
-summary_row <- final_results |>
-  summarise(
-    Fold = "Mean",
-    Accuracy     = mean(Accuracy),
-    F1_score     = mean(F1_score),
-    ROC_AUC      = mean(ROC_AUC),
-    PR_AUC       = mean(PR_AUC),
-    Bal_Accuracy = mean(Bal_Accuracy),
-    Training_time = mean(Training_time),
-    Best_type = NA,
-  )
-
-final_summary <- bind_rows(final_results, summary_row)
-
-cat("\n========== RESULTADOS NESTED CV ==========\n")
-print(final_summary)
-
+cat("\n========== TEST RESULTS ==========\n")
+final_results <- bind_rows(outer_results)
+print(final_results)
 ```
 
-En este proyecto abordamos el problema de predicción sobre el conjunto de datos de marketing bancario de la UCI, aplicando un enfoque riguroso basado en validación cruzada anidada para evaluar modelos de clasificación. Nos centramos inicialmente en modelos lineales implementados con LIBLINEAR, una librería eficiente para problemas de clasificación a gran escala. En concreto, exploramos distintas variantes de regresión logística penalizada (tipos 0, 6 y 7) junto con una búsqueda sobre el hiperparámetro de regularización cost, evaluando cada configuración mediante métricas como ROC AUC, F1-score y Accuracy. Todo el preprocesamiento se realizó dentro de los folds, aplicando transformaciones como step_integer, imputación y normalización, evitando así cualquier fuga de información. Este enfoque permite seleccionar el mejor tipo de modelo y regularización para cada fold, ofreciendo una evaluación realista y generalizable. Si bien el foco estuvo en modelos lineales por su interpretabilidad y rendimiento, en una segunda fase incorporaremos modelos adicionales como árboles de decisión y Naive Bayes para enriquecer la comparación y fortalecer la narrativa de resultados.
 
 
-3. Methods
-3.1 Dataset and Preprocessing
-We used the UCI Bank Marketing Dataset \cite{moro2011bank}, which contains demographic and transactional information about clients contacted by a Portuguese bank during a direct marketing campaign. The task is to predict whether a client will subscribe to a term deposit (yes/no).
-To address class imbalance, the dataset was balanced a priori via oversampling of the minority class. All features were retained in their original format, including categorical variables, which were kept as factors and not one-hot encoded. Instead, categorical predictors were encoded using integer mappings via the step_integer() function from the recipes R package. This approach assigns a unique integer to each category without introducing additional dimensions, ensuring compatibility with linear models such as LIBLINEAR while preserving model compactness.
-Numerical features were standardized using z-score normalization. All preprocessing steps, including encoding and normalization, were applied inside the resampling loop (i.e., fold-wise) to prevent information leakage.
-3.2 Model: LIBLINEAR
-We used LIBLINEAR \cite{fan2008liblinear}, a library for large-scale linear classification, to fit logistic regression models with $\ell_1$ and $\ell_2$ regularization. Specifically, we evaluated the following solvers:
-Type 0: $\ell_2$-regularized logistic regression (primal)
-Type 6: $\ell_1$-regularized logistic regression
-Type 7: $\ell_2$-regularized logistic regression (dual)
-All models produce probabilistic outputs and are suitable for large, sparse datasets. The classification threshold was fixed at 0.5 for evaluation purposes.
-3.3 Hyperparameter Tuning and Evaluation
-We performed hyperparameter tuning over the regularization parameter $C \in {2^{-7}, 2^{-6}, \dots, 2^7}$. Each solver (type) was evaluated across this full grid of $15$ cost values. We employed 5-fold stratified cross-validation, resulting in $3 \times 15 \times 5 = 225$ model fits in total.
-Model performance was assessed using the following metrics, computed on the validation fold of each split:
-Area Under the Receiver Operating Characteristic Curve (ROC AUC)
-Area Under the Precision-Recall Curve (PR AUC)
-F1 score (at threshold 0.5)
-Balanced Accuracy
-Overall Accuracy
-The cross-validation procedure was parallelized using the furrr package to reduce computation time.
-3.4 Model Selection and Final Training
-Model selection was based primarily on ROC AUC. In cases where multiple configurations achieved identical performance (up to numerical precision), the model with the smallest cost parameter was preferred to encourage simplicity.
-The final model—a type 0 logistic regression with $C = 4$—was retrained on the entire training dataset using the same preprocessing pipeline. This model was then used to generate probabilistic predictions on the test set.
+Para iniciar el análisis, se evaluaron modelos lineales empleando la librería LIBLINEAR, una implementación altamente eficiente de regresión logística y máquinas de vectores soporte lineales diseñada para grandes conjuntos de datos. Comenzar con modelos lineales resulta metodológicamente adecuado porque permiten obtener una línea base robusta, son rápidos de entrenar —aspecto especialmente relevante en un escenario de nested cross–validation— y ofrecen interpretabilidad directa a través de sus coeficientes. Dentro de las diferentes variantes disponibles en LIBLINEAR, se seleccionaron específicamente los types 0, 6 y 7, ya que representan las formulaciones que aportan mayor diversidad y valor real al problema. El type 0 (L2–regularized logistic regression, primal) proporciona un modelo probabilístico estable y suele constituir un baseline sólido en clasificación binaria. El type 6 (L2–regularized logistic regression, dual) está optimizado para situaciones con muchas observaciones y pocas variables, una configuración que coincide con la estructura del conjunto de datos empleado. Finalmente, el type 7 (L1–regularized linear SVM) introduce regularización L1, lo que permite realizar una selección automática de variables y explorar una frontera de decisión basada en maximización del margen, complementando así el enfoque probabilístico de la regresión logística. Esta combinación de tres variantes permite cubrir de forma equilibrada distintos comportamientos lineales (probabilístico vs. margen; L1 vs. L2; primal vs. dual), garantizando una comparación inicial amplia y metodológicamente justificada.
 
+https://ml3.leuphana.de/publications/auc.pdf?utm_source=chatgpt.com
+Para la optimización de los modelos lineales, se empleó como criterio principal el AUC-ROC, una métrica especialmente adecuada en problemas originalmente desbalanceados, ya que evalúa la capacidad de ranking del modelo de forma independiente de umbrales específicos de clasificación. Esta métrica se utilizó tanto para comparar configuraciones como para seleccionar el valor óptimo del parámetro de regularización C, escogiendo para cada type de LIBLINEAR aquel coste que maximizaba el AUC en validación. En el caso de los modelos SVM (type 7), que no generan probabilidades calibradas, el AUC se calculó a partir de los decision values, ya que esta métrica únicamente requiere un puntaje continuo que permita ordenar correctamente las instancias. Este procedimiento está sólidamente respaldado por la literatura: Brefeld y Scheffer (2005) demuestran que la AUC equivale a la probabilidad de que el modelo asigne un valor de decisión mayor a una instancia positiva que a una negativa, lo que justifica el uso de scores en modelos que no generan probabilidades
 
-COSAS POR HACER:
-- reportar metricas en training tambien
-- naive bayes y decision tree 
+Una vez identificado el mejor modelo lineal según dicho criterio, se amplió el análisis incorporando dos enfoques conceptualmente distintos: Naive Bayes, como modelo probabilístico generativo, y Decision Tree, capaz de capturar relaciones no lineales y estructuras de decisión jerárquicas. El modelo Naive Bayes se entrenó sin tuning de hiperparámetros, ya que en sus formulaciones clásicas (gaussiana o multinomial) no existe un espacio de hiperparámetros relevante que deba optimizarse mediante validación cruzada. Este modelo se incluye como baseline probabilístico simple, cuya complejidad y supuestos difieren de los modelos lineales.
+
+En el caso del árbol de decisión, sí fue necesario realizar una optimización de hiperparámetros, dado que este tipo de modelo es especialmente sensible a la complejidad estructural del árbol y tiende a sobreajustar si no se aplican restricciones adecuadas. No obstante, para mantener la viabilidad computacional dentro del esquema de nested cross-validation, se optó por una estrategia de tuning ligera centrada exclusivamente en el parámetro de coste-complejidad (cp). Este hiperparámetro controla directamente el proceso de poda y, por tanto, el tamaño efectivo del árbol, siendo el factor que más influye en el equilibrio entre ajuste y generalización. El resto de parámetros se mantuvieron en sus valores por defecto, ya que cp es ampliamente reconocido en la literatura como el elemento clave para regular la capacidad del modelo y evitar sobreajuste. De este modo, se obtuvo un modelo no lineal competitivo sin incurrir en un coste computacional excesivo, garantizando al mismo tiempo la comparabilidad con los modelos lineales y probabilísticos del estudio.
+
+De este modo, se obtuvo una comparación equilibrada entre modelos lineales, probabilísticos y no lineales, permitiendo evaluar cómo distintos supuestos de modelación afectan al rendimiento predictivo.
+
+Para evaluar si las diferencias de rendimiento entre modelos eran genuinas y no producto del azar asociado a la partición de los datos, se utilizaron los resultados obtenidos en los folds externos de la nested cross-validation. Cada outer fold actúa como una estimación independiente del error de generalización, de modo que disponer de cinco folds proporciona cinco mediciones comparables por modelo. Estas repeticiones permiten aplicar pruebas estadísticas no paramétricas para datos emparejados, como el test de Wilcoxon, especialmente adecuadas cuando no se asume normalidad y el número de repeticiones es reducido. Este enfoque sigue las recomendaciones metodológicas establecidas en la literatura para la comparación empírica de clasificadores en experimentos basados en cross-validation (Demšar, 2006). Un valor p inferior a 0.05 indica que las diferencias entre dos modelos son sistemáticas y estadísticamente significativas, mientras que valores no significativos sugieren que el rendimiento observado podría deberse a variabilidad del muestreo. De esta forma, la elección del modelo final se fundamenta no solo en la magnitud de las métricas, sino también en la consistencia estadística de las diferencias entre algoritmos.
+
+Como se reportan las métricas de train?
+
+Para todos los modelos evaluados se adoptó una estrategia homogénea para el cálculo de las métricas de rendimiento, diferenciando claramente entre las métricas utilizadas para la selección de hiperparámetros y las destinadas al análisis final del desempeño. En los casos que requieren tuning (LIBLINEAR y Decision Tree), los hiperparámetros se optimizaron exclusivamente a partir de la validación cruzada interna del outer fold, pero las métricas reportadas corresponden siempre al modelo final entrenado con el conjunto completo de entrenamiento del outer loop. De este modo, tanto LIBLINEAR, como Naive Bayes (que no requiere tuning) y el árbol de decisión disponen de métricas de train y de test obtenidas en las mismas condiciones: todas calculadas sobre los datos del outer fold y nunca sobre particiones internas empleadas para el ajuste de hiperparámetros. Este enfoque garantiza que las métricas de entrenamiento sirven únicamente para diagnosticar el posible sobreajuste y que las métricas de test mantienen una estimación imparcial y comparable del rendimiento de generalización entre modelos.
